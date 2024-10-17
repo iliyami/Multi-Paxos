@@ -145,16 +145,19 @@ class PaxosServer:
         accepted_number = message['accepted_number']
         local_transactions = message['local_transactions']
 
+        isUpToDate = True
         if ballot_number == self.ballot_number:
             self.majority_responses += 1
             if accepted_value is not None and accepted_number > self.ballot_number:
                 # Update with accepted value from other servers
                 self.local_major_block = accepted_value
+                isUpToDate = False
             elif local_transactions is not None:
                 self.local_major_block += local_transactions
             if self.majority_responses >= MAJORITY:
                 # Majority reached, send ACCEPT message
-                self.local_major_block += self.transactions_log
+                if isUpToDate:
+                    self.local_major_block += self.transactions_log
                 self.send_accept()
 
     def send_accept(self):
