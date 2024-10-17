@@ -209,7 +209,7 @@ class PaxosServer:
         PaxosServer.pending_paxos = False
         self.datastore.append(major_block)
         self.last_committed_block = lcm_ballot
-        self.transactions_log.clear()  # Clear the local log as it's now committed
+        self.clear_outdated_logs(major_block)  # Clear the local log as it's now committed
         print(f"Server {self.server_id}: Committed major block {major_block} to datastore.")
 
         # Broadcast COMMIT message to all other servers
@@ -233,8 +233,12 @@ class PaxosServer:
         print(f"Server {self.server_id}: Committing {major_block} to datastore.")
         self.datastore.append(major_block)
         self.last_committed_block = lcm_ballot
-        self.transactions_log.clear()  # Clear the log as it's committed
+        self.clear_outdated_logs(major_block)  # Clear the log as it's committed
         self.handle_consensus_completion()
+
+    def clear_outdated_logs(self, major_block):
+        mb_sequences = [item[0] for item in major_block]
+        self.transactions_log = [transaction for transaction in self.transactions_log if transaction[0] not in mb_sequences]
 
     def request_missing_blocks(self, leader_id, missing_from_block):
         """Request missing blocks from the leader to catch up."""
