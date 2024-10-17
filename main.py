@@ -211,7 +211,7 @@ class PaxosServer:
         for trans in major_block:
             if trans not in unique_major_block:
                 unique_major_block.append(trans)
-        self.datastore.append({lcm_ballot: unique_major_block})
+        self.datastore.append(unique_major_block)
         self.last_committed_block = lcm_ballot
         self.clear_outdated_logs(unique_major_block)  # Clear the local log as it's now committed
         print(f"Server {self.server_id}: Committed major block {unique_major_block} to datastore.")
@@ -235,7 +235,7 @@ class PaxosServer:
         major_block = message['major_block']
         lcm_ballot = message['last_committed_block']
         print(f"Server {self.server_id}: Committing {major_block} to datastore.")
-        self.datastore.append({lcm_ballot: major_block})
+        self.datastore.append(major_block)
         self.last_committed_block = lcm_ballot
         self.clear_outdated_logs(major_block)  # Clear the log as it's committed
         self.handle_consensus_completion()
@@ -251,7 +251,6 @@ class PaxosServer:
                 'type': 'catch_up_request',
                 'sender_id': self.server_id,
                 'last_committed_block': last_committed_block,
-                'requester_last_committed_block': requester_lcb,
             }
         }
         leader_port = self.find_port(leader_id)
@@ -260,10 +259,9 @@ class PaxosServer:
     def handle_catch_up_request(self, message):
         last_committed_block = message['last_committed_block']
         requester_id = message['sender_id']
-        requester_lcb = message['requester_last_committed_block']
 
         # Find the missing blocks and send them to the requester
-        missing_blocks = self.get_missing_blocks(requester_lcb)
+        missing_blocks = self.get_missing_blocks()
         response_message = {
             'paxos': {
                 'type': 'catch_up_response',
@@ -279,7 +277,7 @@ class PaxosServer:
         # Append missing blocks to the datastore
         missing_blocks = message['missing_blocks']
         lcm_ballot = message['last_committed_block']
-        self.datastore.append({lcm_ballot: missing_blocks})
+        self.datastore = missing_blocks
         self.last_committed_block = lcm_ballot
         self.clear_outdated_logs(missing_blocks)  # Clear the local log as it's now committed
         print(f"Server {self.server_id}: Caught up with missing blocks.")
@@ -295,7 +293,7 @@ class PaxosServer:
 
         all_transactions = []
         for block in self.datastore:
-            for transaction in block.popitem():
+            for transaction in block:
                 all_transactions.append(transaction)
         all_transactions += self.transactions_log
         sorted_transactions = sorted(all_transactions, key=lambda t: t[0])
@@ -329,18 +327,9 @@ class PaxosServer:
             print(f"Server {self.server_id}: Processing queued transaction {transaction}.")
             self.handle_transaction(transaction)
 
-    def get_missing_blocks(self, requester_lcb):
+    def get_missing_blocks(self):
         # Return blocks from the last_committed_block index to the end of the datastore
-        if requester_lcb[0] == 0:
-            return self.datastore.copy()
-        found_key = False
-        result = []
-        for lcb, block in self.datastore.items():
-          if lcb == requester_lcb:
-            found_key = True
-          if found_key:
-            result.append({lcb: block})
-        return result
+        return self.datastore.copy()
 
             
 def send_transaction_to_server(server_port, transaction):
