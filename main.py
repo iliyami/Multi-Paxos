@@ -10,8 +10,11 @@ INITIAL_BALANCE = 100
 NUM_SERVERS = 3
 MAJORITY = NUM_SERVERS // 2 + 1  # Paxos requires a majority to commit
 
+
 # Sample server class handling TCP connections and Paxos protocol
 class PaxosServer:
+    round_number = 0
+    pending_paxos = False
     def __init__(self, server_id, port, peers):
         self.server_id = server_id
         self.port = port
@@ -28,7 +31,7 @@ class PaxosServer:
         self.local_major_block = []
         self.lock = threading.Lock()  # For thread safety
         self.last_committed_block = (0, 0)
-        self.pending_transaction = None
+        self.transaction_queue = Queue()
         
     def start_server(self):
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -55,13 +58,18 @@ class PaxosServer:
     # ------------- Paxos Phases ----------------- #
     
     def handle_transaction(self, transaction):
+        if PaxosServer.pending_paxos:
+            print(f"Server {self.server_id}: Paxos is in progress. Queuing transaction {transaction}.")
+            self.transaction_queue.put(transaction)
+            return
         seq_num, trans = transaction
         sender, receiver, amount = trans
         # If balance is insufficient, initiate Paxos protocol
         self.check_balance()
         if self.balance < amount:
             print(f"Server {self.server_id}: Insufficient funds, initiating Paxos for transaction {transaction}")
-            self.pending_transaction = transaction
+            print(f"Server {self.server_id}: Queuing transaction {transaction}.")
+            self.transaction_queue.put(transaction)
             self.initiate_paxos(transaction)
         else:
             # Process the transaction locally and update log
@@ -70,14 +78,14 @@ class PaxosServer:
             print(f"Server {self.server_id}: Processed transaction {transaction}")
 
     def initiate_paxos(self, transaction):
-        self.pending_paxos = True
-        self.ballot_number += 1
+        PaxosServer.pending_paxos = True
+        PaxosServer.round_number += 1
+        self.ballot_number = PaxosServer.round_number
         # Send PREPARE message to all peers
         for peer_port in self.peers:
             self.send_prepare(peer_port)
 
     def send_prepare(self, peer_port):
-        #TODO last commited block number
         message = {'paxos': {
             'type': 'prepare',
             'ballot_number': self.ballot_number,
@@ -128,6 +136,7 @@ class PaxosServer:
             }
 
             sender_id_port = next((item for item in self.peers if item % 1000 == sender_id), None)
+            # print(f'Sending Promissssse because of: {transaction} ballot: {ballot_number}, last block msg: {last_committed_block} last block: {self.last_committed_block}')
             self.send_message(sender_id_port, response)
 
     def handle_promise(self, message):
@@ -194,7 +203,7 @@ class PaxosServer:
         lcm_ballot = (self.ballot_number, self.server_id)
         if (self.last_committed_block[0] >= lcm_ballot[0]):
             return
-        self.pending_paxos = False
+        PaxosServer.pending_paxos = False
         self.datastore.append(major_block)
         self.last_committed_block = lcm_ballot
         self.transactions_log.clear()  # Clear the local log as it's now committed
@@ -222,6 +231,7 @@ class PaxosServer:
         self.datastore.append(major_block)
         self.last_committed_block = lcm_ballot
         self.transactions_log.clear()  # Clear the log as it's committed
+        self.handle_consensus_completion()
 
     def request_missing_blocks(self, leader_id, missing_from_block):
         """Request missing blocks from the leader to catch up."""
@@ -278,11 +288,9 @@ class PaxosServer:
                 self.balance += amount
 
     def handle_consensus_completion(self):
+        PaxosServer.pending_paxos = False
         self.calculate_balance()
-    
-        if self.pending_transaction:
-            self.handle_transaction(self.pending_transaction)
-        self.pending_transaction = None
+        self.process_queued_transactions()
     
     def check_balance(self):
         self.calculate_balance()
@@ -294,6 +302,12 @@ class PaxosServer:
             peer_socket.send(json.dumps(message).encode())
         finally:
             peer_socket.close()
+
+    def process_queued_transactions(self):
+        while not self.transaction_queue.empty():
+            transaction = self.transaction_queue.get()
+            print(f"Server {self.server_id}: Processing queued transaction {transaction}.")
+            self.handle_transaction(transaction)
 
             
 def send_transaction_to_server(server_port, transaction):
@@ -352,7 +366,7 @@ for set_number, test_data in test_sets.items():
         # If the server is in the live_servers, send the transaction to that server
         if server_port%1000 in live_servers:
             print(f"Sending transaction {transaction} to server {sender_server_id} on port {server_port}")
-            time.sleep(1)
+            # time.sleep(1)
             send_transaction_to_server(server_port, transaction)
         else:
             print(f"Server {sender_server_id} is down, skipping transaction {transaction}")
