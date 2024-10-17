@@ -30,8 +30,6 @@ class PaxosServer:
         self.last_committed_block = (0, 0)
         self.pending_transaction = None
         
-        self.prepare_queue = Queue()
-
     def start_server(self):
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_socket.bind(('localhost', self.port))
@@ -60,6 +58,7 @@ class PaxosServer:
         seq_num, trans = transaction
         sender, receiver, amount = trans
         # If balance is insufficient, initiate Paxos protocol
+        self.check_balance()
         if self.balance < amount:
             print(f"Server {self.server_id}: Insufficient funds, initiating Paxos for transaction {transaction}")
             self.pending_transaction = transaction
@@ -195,6 +194,7 @@ class PaxosServer:
         lcm_ballot = (self.ballot_number, self.server_id)
         if (self.last_committed_block[0] >= lcm_ballot[0]):
             return
+        self.pending_paxos = False
         self.datastore.append(major_block)
         self.last_committed_block = lcm_ballot
         self.transactions_log.clear()  # Clear the local log as it's now committed
@@ -267,6 +267,7 @@ class PaxosServer:
         for block in self.datastore:
             for transaction in block:
                 all_transactions.append(transaction)
+        all_transactions += self.transactions_log
         sorted_transactions = sorted(all_transactions, key=lambda t: t[0])
 
         for transaction in sorted_transactions:
@@ -283,12 +284,8 @@ class PaxosServer:
             self.handle_transaction(self.pending_transaction)
         self.pending_transaction = None
     
-    # def check_balance(self):
-    #     # Check balance based on local log and committed datastore
-    #     balance = self.balance
-    #     for transaction in self.transactions_log:
-    #         balance -= transaction['amount']
-    #     return balance
+    def check_balance(self):
+        self.calculate_balance()
 
     def send_message(self, peer_port, message):
         peer_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
