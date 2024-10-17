@@ -42,6 +42,10 @@ python main.py
 - `PrintDB <server_id>`: Print the current datastore
 - `Performance`: Print throughput and latency metrics
 
+## Fix known setup issues
+1. Server failed to run due to used address
+
+        sudo lsof -t -i:<port_num>
 
 ## Implementation Details
 
