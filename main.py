@@ -207,10 +207,14 @@ class PaxosServer:
         if (self.last_committed_block[0] >= lcm_ballot[0]):
             return
         PaxosServer.pending_paxos = False
-        self.datastore.append(major_block)
+        unique_major_block = []
+        for trans in major_block:
+            if trans not in unique_major_block:
+                unique_major_block.append(trans)
+        self.datastore.append(unique_major_block)
         self.last_committed_block = lcm_ballot
-        self.clear_outdated_logs(major_block)  # Clear the local log as it's now committed
-        print(f"Server {self.server_id}: Committed major block {major_block} to datastore.")
+        self.clear_outdated_logs(unique_major_block)  # Clear the local log as it's now committed
+        print(f"Server {self.server_id}: Committed major block {unique_major_block} to datastore.")
 
         # Broadcast COMMIT message to all other servers
         for peer_port in self.peers:
@@ -218,7 +222,7 @@ class PaxosServer:
                 'paxos': {
                     'type': 'commit',
                     'ballot_number': self.ballot_number,
-                    'major_block': major_block,
+                    'major_block': unique_major_block,
                     'last_committed_block': lcm_ballot
                 }
             }
