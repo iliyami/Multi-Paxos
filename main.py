@@ -4,6 +4,8 @@ import json
 from queue import Queue
 import time
 import csv
+import sqlite3
+import os
 
 # Constants
 INITIAL_BALANCE = 100
@@ -15,26 +17,81 @@ MAJORITY = NUM_SERVERS // 2 + 1  # Paxos requires a majority to commit
 class PaxosServer:
     round_number = 0
     pending_paxos = False
-    def __init__(self, server_id, port, peers):
+    def __init__(self, server_id, port, peers, db_file):
         self.server_id = server_id
         self.port = port
         self.peers = peers  # List of peer server ports
         self.transactions_log = []  # Local log of transactions
-        self.datastore = []  # List of committed blocks
         self.balance = INITIAL_BALANCE  # Initial balance for this server
         self.is_leader = False
         self.ballot_number = 0
         self.promised_number = 0  # For promise phase
         self.accepted_value = None
         self.accepted_number = 0
-        self.majority_responses = 0  # Count for majority
+        self.majority_responses = 0
+        self.majority_reached = False
         self.local_major_block = []
         self.lock = threading.Lock()  # For thread safety
         self.last_committed_block = (0, 0)
         self.transaction_queue = Queue()
+
+        self.conn = sqlite3.connect(db_file, check_same_thread=False)
+        self.cursor = self.conn.cursor()
+        self.cursor.execute('''CREATE TABLE IF NOT EXISTS transactions
+                               (sequence_number INTEGER PRIMARY KEY,
+                                sender INTEGER,
+                                receiver INTEGER,
+                                amount INTEGER,
+                                ballot_number INTEGER,
+                                process_id INTEGER)''')
+        self.conn.commit()
+
+    def close(self):
+        self.conn.close()
+
+    def add_transaction_to_datastore(self, block, ballot):
+        ballot_number, process_id = ballot
+        new_curstor = self.conn.cursor()
+        data_to_insert = []
+        for transaction in block:
+            sequence_number, details = transaction[0], transaction[1]
+            sender, receiver, amount = details
+            data_to_insert.append((sequence_number, sender, receiver, amount, ballot_number, process_id))
+
+        new_curstor.executemany('''
+            INSERT OR IGNORE INTO transactions (sequence_number, sender, receiver, amount, ballot_number, process_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', data_to_insert)
+            
+        if new_curstor.rowcount > 0:
+            self.conn.commit()
+        new_curstor.close()
+        print(f"Server {self.server_id}: Transaction {block} added to persistent datastore (DB).")
+
+    def replace_datastore(self, new_datastore):
+        self.cursor.execute('DELETE FROM transactions')
+        self.conn.commit()
+
+        for transaction in new_datastore:
+            sequence_number, sender, receiver, amount, ballot_number, process_id = transaction
+
+            self.cursor.execute('''
+                INSERT OR IGNORE INTO transactions (sequence_number, sender, receiver, amount, ballot_number, process_id)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (sequence_number, sender, receiver, amount, ballot_number, process_id))
+
+        self.conn.commit()
+        print(f"Server {self.server_id}: Replaced the datastore with the new given datastore.")
+
+    def get_all_transactions(self):
+        new_cursor = self.conn.cursor()
+        new_cursor.execute('SELECT * FROM transactions')
+        transactions = new_cursor.fetchall()
+        return transactions
         
     def start_server(self):
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server_socket.bind(('localhost', self.port))
         server_socket.listen(5)
         print(f"Server {self.server_id} started on port {self.port}")
@@ -67,7 +124,6 @@ class PaxosServer:
         # If balance is insufficient, initiate Paxos protocol
         self.check_balance()
         if self.balance < amount:
-            print(f"Server {self.server_id}: Insufficient funds, initiating Paxos for transaction {transaction}")
             print(f"Server {self.server_id}: Queuing transaction {transaction}.")
             self.transaction_queue.put(transaction)
             self.initiate_paxos(transaction)
@@ -197,7 +253,8 @@ class PaxosServer:
             self.majority_responses += 1
             print(f"Server {self.server_id}: Received ACCEPTED message from server {message['sender_id']}")
 
-            if self.majority_responses >= MAJORITY:
+            if self.majority_responses >= MAJORITY and self.majority_reached == False:
+                self.majority_reached = True
                 # print(f"Server {self.server_id}: Reached majority, committing block {major_block}")
                 self.commit_transaction(major_block)
 
@@ -206,15 +263,15 @@ class PaxosServer:
         lcm_ballot = (self.ballot_number, self.server_id)
         if (self.last_committed_block[0] >= lcm_ballot[0]):
             return
-        PaxosServer.pending_paxos = False
         unique_major_block = []
         for trans in major_block:
             if trans not in unique_major_block:
                 unique_major_block.append(trans)
-        self.datastore.append(unique_major_block)
+        self.add_transaction_to_datastore(unique_major_block, lcm_ballot)
         self.last_committed_block = lcm_ballot
-        self.clear_outdated_logs(unique_major_block)  # Clear the local log as it's now committed
-        print(f"Server {self.server_id}: Committed major block {unique_major_block} to datastore.")
+        self.majority_reached = False
+        self.clear_outdated_logs(unique_major_block)
+        PaxosServer.pending_paxos = False
 
         # Broadcast COMMIT message to all other servers
         for peer_port in self.peers:
@@ -234,8 +291,7 @@ class PaxosServer:
         # Commit the major block to the datastore
         major_block = message['major_block']
         lcm_ballot = message['last_committed_block']
-        print(f"Server {self.server_id}: Committing {major_block} to datastore.")
-        self.datastore.append(major_block)
+        self.add_transaction_to_datastore(major_block, lcm_ballot)
         self.last_committed_block = lcm_ballot
         self.clear_outdated_logs(major_block)  # Clear the log as it's committed
         self.handle_consensus_completion()
@@ -243,6 +299,8 @@ class PaxosServer:
     def clear_outdated_logs(self, major_block):
         mb_sequences = [item[0] for item in major_block]
         self.transactions_log = [transaction for transaction in self.transactions_log if transaction[0] not in mb_sequences]
+        self.accepted_number = 0
+        self.accepted_value = None
 
     def request_missing_blocks(self, leader_id, last_committed_block, requester_lcb):
         """Request missing blocks from the leader to catch up."""
@@ -277,7 +335,7 @@ class PaxosServer:
         # Append missing blocks to the datastore
         missing_blocks = message['missing_blocks']
         lcm_ballot = message['last_committed_block']
-        self.datastore = missing_blocks
+        self.replace_datastore(missing_blocks)
         self.last_committed_block = lcm_ballot
         self.clear_outdated_logs(missing_blocks)  # Clear the local log as it's now committed
         print(f"Server {self.server_id}: Caught up with missing blocks.")
@@ -291,11 +349,11 @@ class PaxosServer:
     def calculate_balance(self):
         self.balance = INITIAL_BALANCE
 
-        all_transactions = []
-        for block in self.datastore:
-            for transaction in block:
-                all_transactions.append(transaction)
-        all_transactions += self.transactions_log
+        all_transactions = self.transactions_log.copy()
+        datastore = self.get_all_transactions()
+        for trans in datastore:
+            sequence_number, sender, receiver, amount, ballot_number, process_id = trans
+            all_transactions.append([sequence_number, [sender, receiver, amount]])
         sorted_transactions = sorted(all_transactions, key=lambda t: t[0])
 
         for transaction in sorted_transactions:
@@ -306,7 +364,6 @@ class PaxosServer:
                 self.balance += amount
 
     def handle_consensus_completion(self):
-        PaxosServer.pending_paxos = False
         self.calculate_balance()
         self.process_queued_transactions()
     
@@ -328,8 +385,7 @@ class PaxosServer:
             self.handle_transaction(transaction)
 
     def get_missing_blocks(self):
-        # Return blocks from the last_committed_block index to the end of the datastore
-        return self.datastore.copy()
+        return self.get_all_transactions()
 
             
 def send_transaction_to_server(server_port, transaction):
@@ -362,15 +418,24 @@ def read_input_file(filename):
             test_sets[current_set]['transactions'].append((sequence_number, transaction))
     return test_sets
 
+def start_server(server_id, port, peers):
+    db_file = f'dbs/server_{server_id}.db'
+    # Remove the existing database file if it exists
+    if os.path.exists(db_file):
+        os.remove(db_file)
+    server = PaxosServer(server_id, port, peers, db_file=db_file)
+    server.start_server()
+    return server
+
 # Initialize servers and peers
-servers = []
+threads = []
 ports = [8001, 8002, 8003]
 for i in range(len(ports)):
     peers = [port for port in ports if port != ports[i]]
-    server = PaxosServer(i + 1, ports[i], peers)
-    servers.append(server)
     try:
-        threading.Thread(target=server.start_server, daemon=True).start()
+        thread = threading.Thread(target=start_server, args=(i + 1, ports[i], peers), daemon=True)
+        thread.start()
+        threads.append(thread)
     except Exception as e:
         print(f"Error starting server thread: {e}")
 
@@ -387,9 +452,10 @@ for set_number, test_data in test_sets.items():
         
         # If the server is in the live_servers, send the transaction to that server
         if server_port%1000 in live_servers:
-            print(f"Sending transaction {transaction} to server {sender_server_id} on port {server_port}")
+            # print(f"Sending transaction {transaction} to server {sender_server_id} on port {server_port}")
             # time.sleep(1)
             send_transaction_to_server(server_port, transaction)
         else:
             print(f"Server {sender_server_id} is down, skipping transaction {transaction}")
-    input(f"Test Set {set_number} executed. Press Enter to continue to the next set...")
+    
+    input(f"\nTest Set {set_number} executed. Press Enter to continue to the next set...\n")
