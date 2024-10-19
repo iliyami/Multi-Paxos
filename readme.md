@@ -62,8 +62,8 @@ The implementation aims to demonstrate reasonable performance in terms of throug
 ## Bonus Features (Optional)
 
 - [ ] Modified Multi-Paxos protocol
-- [ ] Database integration for datastore
-- [ ] Efficient balance retrieval across servers
+- [X] Database integration for datastore
+- [X] Efficient balance retrieval across servers
 
 ## Deadline
 
