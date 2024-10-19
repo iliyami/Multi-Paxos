@@ -35,6 +35,9 @@ class PaxosServer:
         self.lock = threading.Lock()  # For thread safety
         self.last_committed_block = (0, 0)
         self.transaction_queue = Queue()
+        self.total_transaction_time = 0  # Total time spent processing transactions
+        self.total_transactions_committed = 0  # Count of committed transactions
+        self.start_time = time.time() # Server start time (for transactions per second)
 
         self.conn = sqlite3.connect(db_file, check_same_thread=False)
         self.cursor = self.conn.cursor()
@@ -128,8 +131,10 @@ class PaxosServer:
             self.local_logs()
         elif command_type == 'print_db':
             self.db_dump()
-        elif command_type == 'performance':
-            self.performance()
+        elif command_type == 'performance_request':
+            self.performance_request()
+        elif command_type == 'performance_response':
+            self.performance_response()
     
     def handle_transaction(self, payload):
         transaction = payload['transaction']
@@ -289,11 +294,17 @@ class PaxosServer:
         for trans in major_block:
             if trans not in unique_major_block:
                 unique_major_block.append(trans)
+        start_time = time.time()
         self.add_transaction_to_datastore(unique_major_block, lcm_ballot)
         self.last_committed_block = lcm_ballot
         self.majority_reached = False
         self.clear_outdated_logs(unique_major_block)
         PaxosServer.pending_paxos = False
+
+        # Update performance metrics
+        processing_time = time.time() - start_time  # Calculate processing time
+        self.total_transaction_time += processing_time
+        self.total_transactions_committed += 1
 
         # Broadcast COMMIT message to all other servers
         for peer_port in self.peers:
@@ -362,6 +373,25 @@ class PaxosServer:
         self.clear_outdated_logs(missing_blocks)  # Clear the local log as it's now committed
         print(f"Server {self.server_id}: Caught up with missing blocks.")
 
+    def calculate_performance(self):
+        # Time since the server started
+        elapsed_time = time.time() - self.start_time
+
+        # Calculate average processing time per transaction
+        if self.total_transactions_committed > 0:
+            avg_processing_time = self.total_transaction_time / self.total_transactions_committed
+        else:
+            avg_processing_time = 0
+
+        # Calculate transactions per second
+        if elapsed_time > 0:
+            transactions_per_second = self.total_transactions_committed / elapsed_time
+        else:
+            transactions_per_second = 0
+
+        print(f"Server {self.server_id} Performance:")
+        print(f" - Avg Processing Time per Transaction: {avg_processing_time:.4f} seconds")
+        print(f" - Transactions Committed per Second: {transactions_per_second:.4f}")
 
     # -------- Commands -------- #
     def client_balance(self, command):
@@ -377,8 +407,16 @@ class PaxosServer:
     def db_dump(self):
         print(f'Server {self.server_id} datastore dump:\n{self.get_all_transactions()}')
 
-    def performance(self):
-        print(f'Server {self.server_id} performance is -')
+    def performance_request(self):
+        self.calculate_performance()
+        message = {'command': {
+        'type': 'performance_response',
+        }}
+        for peer_port in self.peers:
+            self.send_message(peer_port, message)
+
+    def performance_response(self):
+        self.calculate_performance()
 
     def client_balance_request(self, command):
         client = command['client']
@@ -527,7 +565,7 @@ def print_db(server_id):
 def performance(server_id):
     server_port = server_id + 8000
     message = {'command': {
-        'type': 'performance',
+        'type': 'performance_request',
     }}
     send_message_to_server(server_port, message)
 
