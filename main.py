@@ -111,8 +111,16 @@ class PaxosServer:
             self.handle_transaction(request['transaction'])
         elif 'paxos' in request:
             self.handle_paxos_message(request['paxos'])
+        elif'command' in request:
+            self.handle_command(request['command'])
 
     # ------------- Paxos Phases ----------------- #
+    def handle_command(self, command):
+        command_type = command['type']
+        if command_type == 'client_balance_request':
+            self.client_balance_request(command)
+        if command_type == 'client_balance_response':
+            self.client_balance_response(command)
     
     def handle_transaction(self, transaction):
         if PaxosServer.pending_paxos:
@@ -341,13 +349,35 @@ class PaxosServer:
         print(f"Server {self.server_id}: Caught up with missing blocks.")
 
 
+    # -------- Commands -------- #
+    def client_balance_request(self, command):
+        client = command['client']
+        message = {
+            'command': {
+                'type': 'client_balance_response',
+                'sender_id': self.server_id,
+                'client': client,
+            }
+        }
+        for peer_port in self.peers:
+            self.send_message(peer_port, message)
+        print(f'Client {client} total balance is {self.calculate_balance()} in server {self.server_id}')
+
+    def client_balance_response(self, message):
+        sender_id = message['sender_id']
+        client = message['client']
+        balance = self.calculate_balance(client)
+        print(f'Client {client} total balance is {balance} in server {self.server_id}')
+
     # -------- Helper Methods -------- #
 
     def find_port(self, sender_id):
         return next((item for item in self.peers if item % 1000 == sender_id), None)
 
-    def calculate_balance(self):
-        self.balance = INITIAL_BALANCE
+    def calculate_balance(self, client=None):
+        if client == None:
+            client = self.server_id
+        balance = INITIAL_BALANCE
 
         all_transactions = self.transactions_log.copy()
         datastore = self.get_all_transactions()
@@ -358,10 +388,13 @@ class PaxosServer:
 
         for transaction in sorted_transactions:
             sender, receiver, amount = transaction[1]
-            if sender == self.server_id:
-                self.balance -= amount
-            elif receiver == self.server_id:
-                self.balance += amount
+            if sender == client:
+                balance -= amount
+            elif receiver == client:
+                balance += amount
+        if client == self.server_id:
+            self.balance = balance
+        return balance
 
     def handle_consensus_completion(self):
         self.calculate_balance()
