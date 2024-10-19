@@ -170,15 +170,15 @@ class PaxosServer:
     def handle_prepare(self, message):
         ballot_number = message['ballot_number']
         sender_id = message['sender_id']
-        last_committed_block = message['last_committed_block']
+        leader_lcm = message['last_committed_block']
 
-        if ballot_number > self.promised_number:
+        if leader_lcm[0] >= self.last_committed_block[0] and ballot_number > self.promised_number:
             self.promised_number = ballot_number
 
              # Catch-up mechanism: If the last committed block of the sender is ahead of this server
-            if last_committed_block[0] > self.last_committed_block[0]:
+            if leader_lcm[0] > self.last_committed_block[0]:
                 print(f"Server {self.server_id}: Behind, requesting missing blocks from leader.")
-                self.request_missing_blocks(sender_id, last_committed_block, self.last_committed_block)
+                self.request_missing_blocks(sender_id, leader_lcm, self.last_committed_block)
             
             response = {
                 'paxos': {
