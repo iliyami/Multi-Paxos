@@ -20,15 +20,16 @@ class PaxosServer:
     def __init__(self, server_id, port, peers, db_file):
         self.server_id = server_id
         self.port = port
-        self.peers = peers  # List of peer server ports
-        self.transactions_log = []  # Local log of transactions
-        self.balance = INITIAL_BALANCE  # Initial balance for this server
+        self.live_servers = []
+        self.peers = peers
+        self.transactions_log = []
+        self.balance = INITIAL_BALANCE
         self.is_leader = False
         self.ballot_number = 0
-        self.promised_number = 0  # For promise phase
+        self.promised_number = 0
         self.accepted_value = None
         self.accepted_number = 0
-        self.majority_responses = 0
+        self.majority_responses = 1
         self.majority_reached = False
         self.local_major_block = []
         self.lock = threading.Lock()  # For thread safety
@@ -108,7 +109,7 @@ class PaxosServer:
         data = conn.recv(1024).decode()
         request = json.loads(data)
         if 'transaction' in request:
-            self.handle_transaction(request['transaction'])
+            self.handle_transaction(request)
         elif 'paxos' in request:
             self.handle_paxos_message(request['paxos'])
         elif'command' in request:
@@ -130,7 +131,10 @@ class PaxosServer:
         elif command_type == 'performance':
             self.performance()
     
-    def handle_transaction(self, transaction):
+    def handle_transaction(self, payload):
+        transaction = payload['transaction']
+        self.live_servers = payload['live_servers']
+            
         if PaxosServer.pending_paxos:
             print(f"Server {self.server_id}: Paxos is in progress. Queuing transaction {transaction}.")
             self.transaction_queue.put(transaction)
@@ -154,8 +158,10 @@ class PaxosServer:
         PaxosServer.round_number += 1
         self.ballot_number = PaxosServer.round_number
         # Send PREPARE message to all peers
+        live_ports = [server + 8000 for server in self.live_servers if server != self.server_id]
         for peer_port in self.peers:
-            self.send_prepare(peer_port)
+            if peer_port in live_ports:
+                self.send_prepare(peer_port)
 
     def send_prepare(self, peer_port):
         message = {'paxos': {
@@ -439,7 +445,7 @@ class PaxosServer:
         while not self.transaction_queue.empty():
             transaction = self.transaction_queue.get()
             print(f"Server {self.server_id}: Processing queued transaction {transaction}.")
-            self.handle_transaction(transaction)
+            self.handle_transaction({'transaction': transaction, 'live_servers': self.live_servers})
 
     def get_missing_blocks(self):
         return self.get_all_transactions()
@@ -559,7 +565,7 @@ for set_number, test_data in test_sets.items():
         
         # If the server is in the live_servers, send the transaction to that server
         if server_port%1000 in live_servers:
-            # print(f"Sending transaction {transaction} to server {sender_server_id} on port {server_port}")
+            print(f"Sending transaction {transaction} to server {sender_server_id} on port {server_port}")
             # time.sleep(1)
             send_transaction_to_server(server_port, transaction, live_servers)
         else:
