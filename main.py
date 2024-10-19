@@ -9,7 +9,7 @@ import os
 
 # Constants
 INITIAL_BALANCE = 100
-NUM_SERVERS = 3
+NUM_SERVERS = 5
 MAJORITY = NUM_SERVERS // 2 + 1  # Paxos requires a majority to commit
 
 
@@ -29,15 +29,20 @@ class PaxosServer:
         self.promised_number = 0
         self.accepted_value = None
         self.accepted_number = 0
-        self.majority_responses = 1
-        self.majority_reached = False
         self.local_major_block = []
-        self.lock = threading.Lock()  # For thread safety
         self.last_committed_block = (0, 0)
         self.transaction_queue = Queue()
         self.total_transaction_time = 0  # Total time spent processing transactions
         self.total_transactions_committed = 0  # Count of committed transactions
         self.start_time = time.time() # Server start time (for transactions per second)
+        self.majority_responses = 1
+        self.majority_reached = False
+        self.accept_majority_responses = 1
+        self.accept_majority_reached = False
+        self.response_lock = threading.Lock()
+        self.accept_response_lock = threading.Lock()
+        self.condition = threading.Condition(self.response_lock)  # Condition to wait for responses
+        self.accept_condition = threading.Condition(self.accept_response_lock)  # Separate condition for accepted phase
 
         self.conn = sqlite3.connect(db_file, check_same_thread=False)
         self.cursor = self.conn.cursor()
@@ -135,7 +140,7 @@ class PaxosServer:
             self.performance_request()
         elif command_type == 'performance_response':
             self.performance_response()
-    
+
     def handle_transaction(self, payload):
         transaction = payload['transaction']
         self.live_servers = payload['live_servers']
@@ -162,12 +167,33 @@ class PaxosServer:
         PaxosServer.pending_paxos = True
         PaxosServer.round_number += 1
         self.ballot_number = PaxosServer.round_number
+        self.majority_responses = 1
+        self.majority_reached = False
+        self.accept_majority_responses = 1
+        self.accept_majority_reached = False
+
         # Send PREPARE message to all peers
         live_ports = [server + 8000 for server in self.live_servers if server != self.server_id]
         for peer_port in self.peers:
             if peer_port in live_ports:
                 self.send_prepare(peer_port)
+        
+        self.wait_for_majority()
 
+    def wait_for_majority(self, timeout=2):
+        """Wait for majority of promise responses or timeout"""
+        with self.condition:
+            # Wait until a majority is reached or the timeout occurs
+            self.condition.wait_for(lambda: self.majority_reached, timeout=timeout)
+            if self.majority_reached:
+                print(f"Server {self.server_id}: Majority of promises received, proceeding to send accept.")
+                self.majority_reached = False
+                self.send_accept()
+            else:
+                print(f"Server {self.server_id}: Timeout reached, aborting Paxos.")
+                self.majority_reached = False
+
+            
     def send_prepare(self, peer_port):
         message = {'paxos': {
             'type': 'prepare',
@@ -228,23 +254,33 @@ class PaxosServer:
         accepted_number = message['accepted_number']
         local_transactions = message['local_transactions']
 
-        isUpToDate = True
-        if ballot_number == self.ballot_number:
-            self.majority_responses += 1
-            if accepted_value is not None and accepted_number > self.ballot_number:
-                # Update with accepted value from other servers
-                self.local_major_block = accepted_value
-                isUpToDate = False
-            elif local_transactions is not None:
-                self.local_major_block += local_transactions
-            if self.majority_responses >= MAJORITY:
-                # Majority reached, send ACCEPT message
-                if isUpToDate:
-                    self.local_major_block += self.transactions_log
-                self.send_accept()
+        
+        with self.response_lock:
+            isUpToDate = True
+            if ballot_number == self.ballot_number:
+                self.majority_responses += 1
+                if accepted_value is not None and accepted_number > self.ballot_number:
+                    # Update with accepted value from other servers
+                    self.local_major_block = accepted_value
+                    isUpToDate = False
+                elif local_transactions is not None:
+                    self.local_major_block += local_transactions
+                if self.majority_responses >= MAJORITY:
+                    # Majority reached, send ACCEPT message
+                    if isUpToDate:
+                        self.local_major_block += self.transactions_log
+                    start_time = time.time()
+                    while time.time() - start_time < 0.6:
+                        self.response_lock.release()
+                        time.sleep(0.1)  # Wait for 200ms to avoid busy-waiting
+                        self.response_lock.acquire()
+                    self.majority_reached = True
+                    self.majority_responses = 1
+                    self.condition.notify()
 
     def send_accept(self):
-        for peer_port in self.peers:
+        live_ports = [server + 8000 for server in self.live_servers if server != self.server_id]
+        for peer_port in live_ports:
             message = {'paxos': {
                 'type': 'accept',
                 'ballot_number': self.ballot_number,
@@ -252,6 +288,23 @@ class PaxosServer:
                 'major_block': self.local_major_block
             }}
             self.send_message(peer_port, message)
+        self.wait_for_accepted_majority()
+
+    def wait_for_accepted_majority(self, timeout=2):
+        """Wait for majority of accepted responses or timeout"""
+        with self.accept_condition:
+            # Wait until a majority of accepted messages is received or the timeout occurs
+            self.accept_condition.wait_for(lambda: self.accept_majority_reached, timeout=timeout)
+            if self.accept_majority_reached:
+                # Commit the transaction after majority or timeout
+                self.accept_majority_reached = False
+                self.accept_majority_responses = 1
+                PaxosServer.pending_paxos = False
+                self.commit_transaction(self.local_major_block)
+                print(f"Server {self.server_id}: Majority of accepted responses received, committing transaction.")
+            else:
+                print(f"Server {self.server_id}: Timeout reached, proceeding with available accepted responses.")
+
 
     def handle_accept(self, message):
         ballot_number = message['ballot_number']
@@ -273,17 +326,19 @@ class PaxosServer:
 
     def handle_accepted(self, message):
         ballot_number = message['ballot_number']
-        major_block = message['major_block']
+        # major_block = message['major_block']
 
         # Only count accepted responses for the current ballot
-        if ballot_number == self.ballot_number:
-            self.majority_responses += 1
-            print(f"Server {self.server_id}: Received ACCEPTED message from server {message['sender_id']}")
+        with self.accept_response_lock:
+            if ballot_number == self.ballot_number:
+                self.accept_majority_responses += 1
+                print(f"Server {self.server_id}: Received ACCEPTED message from server {message['sender_id']}")
 
-            if self.majority_responses >= MAJORITY and self.majority_reached == False:
-                self.majority_reached = True
-                # print(f"Server {self.server_id}: Reached majority, committing block {major_block}")
-                self.commit_transaction(major_block)
+                if self.accept_majority_responses >= MAJORITY:
+                    self.accept_majority_responses = 1
+                    self.accept_majority_reached = True
+                    self.accept_condition.notify()
+                    # print(f"Server {self.server_id}: Reached majority, committing block {major_block}")
 
     def commit_transaction(self, major_block):
         # Commit the block locally
@@ -297,9 +352,7 @@ class PaxosServer:
         start_time = time.time()
         self.add_transaction_to_datastore(unique_major_block, lcm_ballot)
         self.last_committed_block = lcm_ballot
-        self.majority_reached = False
         self.clear_outdated_logs(unique_major_block)
-        PaxosServer.pending_paxos = False
 
         # Update performance metrics
         processing_time = time.time() - start_time  # Calculate processing time
@@ -520,15 +573,20 @@ def read_input_file(filename):
         next(reader)  # Skip header
         test_sets = {}
         current_set = None
+        live_servers = None
         sequence_number = 0
         for row in reader:
-            if row[0]:  # New set
+            if row[0]:
                 current_set = int(row[0])
+                live_servers = eval(row[2].replace('S', ''))
                 if current_set not in test_sets:
-                    test_sets[current_set] = {'transactions': [], 'live_servers': eval(row[2])}
-            transaction = eval(row[1])
-            sequence_number += 1 
+                    test_sets[current_set] = {'transactions': [], 'live_servers': live_servers}
+            
+            transaction = eval(row[1].replace('S', ''))
+            sequence_number += 1
+            
             test_sets[current_set]['transactions'].append((sequence_number, transaction))
+    
     return test_sets
 
 def start_server(server_id, port, peers):
@@ -580,7 +638,7 @@ def print_balance_across_servers(client):
 
 # Main
 threads = []
-ports = [8001, 8002, 8003]
+ports = [8001, 8002, 8003, 8004, 8005]
 for i in range(len(ports)):
     peers = [port for port in ports if port != ports[i]]
     try:
@@ -591,7 +649,7 @@ for i in range(len(ports)):
         print(f"Error starting server thread: {e}")
 
 time.sleep(2)
-test_sets = read_input_file('tests/input.csv')
+test_sets = read_input_file('tests/input2.csv')
 for set_number, test_data in test_sets.items():
     print(f"Running Test Set {set_number}...")
     transactions = test_data['transactions']
@@ -603,7 +661,7 @@ for set_number, test_data in test_sets.items():
         
         # If the server is in the live_servers, send the transaction to that server
         if server_port%1000 in live_servers:
-            print(f"Sending transaction {transaction} to server {sender_server_id} on port {server_port}")
+            # print(f"Sending transaction {transaction} to server {sender_server_id} on port {server_port}")
             # time.sleep(1)
             send_transaction_to_server(server_port, transaction, live_servers)
         else:
