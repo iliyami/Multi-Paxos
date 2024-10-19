@@ -119,8 +119,16 @@ class PaxosServer:
         command_type = command['type']
         if command_type == 'client_balance_request':
             self.client_balance_request(command)
-        if command_type == 'client_balance_response':
+        elif command_type == 'client_balance_response':
             self.client_balance_response(command)
+        elif command_type == 'print_balance':
+            self.client_balance(command)
+        elif command_type == 'print_log':
+            self.local_logs()
+        elif command_type == 'print_db':
+            self.db_dump()
+        elif command_type == 'performance':
+            self.performance()
     
     def handle_transaction(self, transaction):
         if PaxosServer.pending_paxos:
@@ -350,6 +358,22 @@ class PaxosServer:
 
 
     # -------- Commands -------- #
+    def client_balance(self, command):
+        client = command['client']
+        if (client == None):
+            print('Wrong request format!')
+        balance = self.calculate_balance(client)
+        print(f'Client {client} balance on server {self.server_id} is {balance}')
+
+    def local_logs(self):
+        print(f'Server {self.server_id} local logs:\n{self.transactions_log}')
+
+    def db_dump(self):
+        print(f'Server {self.server_id} datastore dump:\n{self.get_all_transactions()}')
+
+    def performance(self):
+        print(f'Server {self.server_id} performance is -')
+
     def client_balance_request(self, command):
         client = command['client']
         message = {
@@ -361,7 +385,7 @@ class PaxosServer:
         }
         for peer_port in self.peers:
             self.send_message(peer_port, message)
-        print(f'Client {client} total balance is {self.calculate_balance()} in server {self.server_id}')
+        print(f'Client {client} total balance is {self.calculate_balance(client)} in server {self.server_id}')
 
     def client_balance_response(self, message):
         sender_id = message['sender_id']
@@ -421,10 +445,22 @@ class PaxosServer:
         return self.get_all_transactions()
 
             
-def send_transaction_to_server(server_port, transaction):
-    message = {'transaction': transaction}
+def send_transaction_to_server(server_port, transaction, live_servers):
+    message = {'transaction': transaction, 'live_servers': live_servers}
     peer_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
+        peer_socket.connect(('localhost', server_port))
+        peer_socket.send(json.dumps(message).encode())
+    except ConnectionRefusedError:
+        print(f"Error: Could not connect to server on port {server_port}. Is the server running?")
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+    finally:
+        peer_socket.close()
+
+def send_message_to_server(server_port, message):
+    try:
+        peer_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         peer_socket.connect(('localhost', server_port))
         peer_socket.send(json.dumps(message).encode())
     except ConnectionRefusedError:
@@ -460,7 +496,45 @@ def start_server(server_id, port, peers):
     server.start_server()
     return server
 
-# Initialize servers and peers
+def print_balance(client, server_id):
+    server_port = server_id + 8000
+    message = {'command': {
+        'type': 'print_balance',
+        'client': client,
+    }}
+    send_message_to_server(server_port, message)
+
+def print_log(server_id):
+    server_port = server_id + 8000
+    message = {'command': {
+        'type': 'print_log',
+    }}
+    send_message_to_server(server_port, message)
+
+def print_db(server_id):
+    server_port = server_id + 8000
+    message = {'command': {
+        'type': 'print_db',
+    }}
+    send_message_to_server(server_port, message)
+
+def performance(server_id):
+    server_port = server_id + 8000
+    message = {'command': {
+        'type': 'performance',
+    }}
+    send_message_to_server(server_port, message)
+
+def print_balance_across_servers(client):
+    message = {'command': {
+        'type': 'client_balance_request',
+        'client': client
+    }}
+    send_message_to_server(server_port, message)
+
+
+
+# Main
 threads = []
 ports = [8001, 8002, 8003]
 for i in range(len(ports)):
@@ -487,8 +561,40 @@ for set_number, test_data in test_sets.items():
         if server_port%1000 in live_servers:
             # print(f"Sending transaction {transaction} to server {sender_server_id} on port {server_port}")
             # time.sleep(1)
-            send_transaction_to_server(server_port, transaction)
+            send_transaction_to_server(server_port, transaction, live_servers)
         else:
             print(f"Server {sender_server_id} is down, skipping transaction {transaction}")
     
-    input(f"\nTest Set {set_number} executed. Press Enter to continue to the next set...\n")
+    while True:
+        user_input = input(
+            f"\nTest Set {set_number} executed. Press Enter to continue to the next set, "
+            "or enter one of the following options:\n"
+            "1.X.Y - Print Balance for Client X on Server Y\n"
+            "2.X - Print Log for Server X\n"
+            "3.X - Print DB for Server X\n"
+            "4.X - Performance of Server X\n"
+            "5.X (Bonus) - Aggregated Client X Balance Across All Servers"
+            "Your choice: "
+        )
+        if user_input == "":
+            break  # Move to the next set
+        elif user_input.startswith('1.'):
+            try:
+                _, client, server_id = map(int, user_input.split('.'))
+                print_balance(client, server_id)
+            except ValueError:
+                print("Invalid format for PrintBalance. Use 1.X.Y (e.g., 1.1.2 for client 1 on server 2)")
+        elif user_input.startswith('2.'):
+            server_id = int(user_input.split('.')[1])
+            print_log(server_id)
+        elif user_input.startswith('3.'):
+            server_id = int(user_input.split('.')[1])
+            print_db(server_id)
+        elif user_input.startswith('4.'):
+            server_id = int(user_input.split('.')[1])
+            performance(server_id)
+        elif user_input.startswith('5.'):
+            client = int(user_input.split('.')[1])
+            print_balance_across_servers(client)
+        else:
+            print("Invalid input. Try again.")
