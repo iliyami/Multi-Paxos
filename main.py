@@ -75,7 +75,7 @@ class PaxosServer:
         if new_curstor.rowcount > 0:
             self.conn.commit()
         new_curstor.close()
-        print(f"Server {self.server_id}: Transaction {block} added to persistent datastore (DB).")
+        # print(f"Server {self.server_id}: Transaction {block} added to persistent datastore (DB).")
 
     def replace_datastore(self, new_datastore):
         self.cursor.execute('DELETE FROM transactions')
@@ -90,7 +90,7 @@ class PaxosServer:
             ''', (sequence_number, sender, receiver, amount, ballot_number, process_id))
 
         self.conn.commit()
-        print(f"Server {self.server_id}: Replaced the datastore with the new given datastore.")
+        # print(f"Server {self.server_id}: Replaced the datastore with the new given datastore.")
 
     def get_all_transactions(self):
         new_cursor = self.conn.cursor()
@@ -146,7 +146,7 @@ class PaxosServer:
         self.live_servers = payload['live_servers']
             
         if PaxosServer.pending_paxos:
-            print(f"Server {self.server_id}: Paxos is in progress. Queuing transaction {transaction}.")
+            # print(f"Server {self.server_id}: Paxos is in progress. Queuing transaction {transaction}.")
             self.transaction_queue.put(transaction)
             return
         seq_num, trans = transaction
@@ -154,14 +154,14 @@ class PaxosServer:
         # If balance is insufficient, initiate Paxos protocol
         self.check_balance()
         if self.balance < amount:
-            print(f"Server {self.server_id}: Queuing transaction {transaction}.")
+            # print(f"Server {self.server_id}: Queuing transaction {transaction}.")
             self.transaction_queue.put(transaction)
             self.initiate_paxos(transaction)
         else:
             # Process the transaction locally and update log
             self.balance -= amount
             self.transactions_log.append(transaction)
-            print(f"Server {self.server_id}: Processed transaction {transaction}")
+            # print(f"Server {self.server_id}: Processed transaction {transaction}")
 
     def initiate_paxos(self, transaction):
         PaxosServer.pending_paxos = True
@@ -186,11 +186,11 @@ class PaxosServer:
             # Wait until a majority is reached or the timeout occurs
             self.condition.wait_for(lambda: self.majority_reached, timeout=timeout)
             if self.majority_reached:
-                print(f"Server {self.server_id}: Majority of promises received, proceeding to send accept.")
+                # print(f"Server {self.server_id}: Majority of promises received, proceeding to send accept.")
                 self.majority_reached = False
                 self.send_accept()
             else:
-                print(f"Server {self.server_id}: Timeout reached, aborting Paxos.")
+                # print(f"Server {self.server_id}: Timeout reached, aborting Paxos.")
                 self.majority_reached = False
 
             
@@ -230,7 +230,7 @@ class PaxosServer:
 
              # Catch-up mechanism: If the last committed block of the sender is ahead of this server
             if leader_lcm[0] > self.last_committed_block[0]:
-                print(f"Server {self.server_id}: Behind, requesting missing blocks from leader.")
+                # print(f"Server {self.server_id}: Behind, requesting missing blocks from leader.")
                 self.request_missing_blocks(sender_id, leader_lcm, self.last_committed_block)
             
             response = {
@@ -301,9 +301,9 @@ class PaxosServer:
                 self.accept_majority_responses = 1
                 PaxosServer.pending_paxos = False
                 self.commit_transaction(self.local_major_block)
-                print(f"Server {self.server_id}: Majority of accepted responses received, committing transaction.")
-            else:
-                print(f"Server {self.server_id}: Timeout reached, proceeding with available accepted responses.")
+                # print(f"Server {self.server_id}: Majority of accepted responses received, committing transaction.")
+            # else:
+                # print(f"Server {self.server_id}: Timeout reached, proceeding with available accepted responses.")
 
 
     def handle_accept(self, message):
@@ -332,7 +332,7 @@ class PaxosServer:
         with self.accept_response_lock:
             if ballot_number == self.ballot_number:
                 self.accept_majority_responses += 1
-                print(f"Server {self.server_id}: Received ACCEPTED message from server {message['sender_id']}")
+                # print(f"Server {self.server_id}: Received ACCEPTED message from server {message['sender_id']}")
 
                 if self.accept_majority_responses >= MAJORITY:
                     self.accept_majority_responses = 1
@@ -424,7 +424,7 @@ class PaxosServer:
         self.replace_datastore(missing_blocks)
         self.last_committed_block = lcm_ballot
         self.clear_outdated_logs(missing_blocks)  # Clear the local log as it's now committed
-        print(f"Server {self.server_id}: Caught up with missing blocks.")
+        # print(f"Server {self.server_id}: Caught up with missing blocks.")
 
     def calculate_performance(self):
         # Time since the server started
@@ -535,7 +535,7 @@ class PaxosServer:
     def process_queued_transactions(self):
         while not self.transaction_queue.empty():
             transaction = self.transaction_queue.get()
-            print(f"Server {self.server_id}: Processing queued transaction {transaction}.")
+            # print(f"Server {self.server_id}: Processing queued transaction {transaction}.")
             self.handle_transaction({'transaction': transaction, 'live_servers': self.live_servers})
 
     def get_missing_blocks(self):
