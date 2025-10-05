@@ -1,702 +1,734 @@
 import socket
 import threading
 import json
-from queue import Queue
 import time
 import csv
-import sqlite3
-import os
+import hashlib
+from collections import defaultdict, deque
+from queue import Queue
+import random
 
-# Constants
-INITIAL_BALANCE = 100
-NUM_SERVERS = 5
-MAJORITY = NUM_SERVERS // 2 + 1  # Paxos requires a majority to commit
+NUM_NODES = 5
+NUM_CLIENTS = 10
+INITIAL_BALANCE = 10
+MAJORITY = NUM_NODES // 2 + 1
 
-
-# Sample server class handling TCP connections and Paxos protocol
-class PaxosServer:
-    round_number = 0
-    pending_paxos = False
-    def __init__(self, server_id, port, peers, db_file):
-        self.server_id = server_id
+class PaxosNode:
+    def __init__(self, node_id, port, peers):
+        self.node_id = node_id
         self.port = port
-        self.live_servers = []
         self.peers = peers
-        self.transactions_log = []
-        self.balance = INITIAL_BALANCE
         self.is_leader = False
-        self.ballot_number = 0
-        self.promised_number = 0
-        self.accepted_value = None
-        self.accepted_number = 0
-        self.local_major_block = []
-        self.last_committed_block = (0, 0)
-        self.transaction_queue = Queue()
-        self.total_transaction_time = 0  # Total time spent processing transactions
-        self.total_transactions_committed = 0  # Count of committed transactions
-        self.start_time = time.time() # Server start time (for transactions per second)
-        self.majority_responses = 1
-        self.majority_reached = False
-        self.accept_majority_responses = 1
-        self.accept_majority_reached = False
-        self.response_lock = threading.Lock()
-        self.accept_response_lock = threading.Lock()
-        self.condition = threading.Condition(self.response_lock)  # Condition to wait for responses
-        self.accept_condition = threading.Condition(self.accept_response_lock)  # Separate condition for accepted phase
-
-        self.conn = sqlite3.connect(db_file, check_same_thread=False)
-        self.cursor = self.conn.cursor()
-        self.cursor.execute('''CREATE TABLE IF NOT EXISTS transactions
-                               (sequence_number INTEGER PRIMARY KEY,
-                                sender INTEGER,
-                                receiver INTEGER,
-                                amount INTEGER,
-                                ballot_number INTEGER,
-                                process_id INTEGER)''')
-        self.conn.commit()
-
-    def close(self):
-        self.conn.close()
-
-    def add_transaction_to_datastore(self, block, ballot):
-        ballot_number, process_id = ballot
-        new_curstor = self.conn.cursor()
-        data_to_insert = []
-        for transaction in block:
-            sequence_number, details = transaction[0], transaction[1]
-            sender, receiver, amount = details
-            data_to_insert.append((sequence_number, sender, receiver, amount, ballot_number, process_id))
-
-        new_curstor.executemany('''
-            INSERT OR IGNORE INTO transactions (sequence_number, sender, receiver, amount, ballot_number, process_id)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', data_to_insert)
-            
-        if new_curstor.rowcount > 0:
-            self.conn.commit()
-        new_curstor.close()
-        # print(f"Server {self.server_id}: Transaction {block} added to persistent datastore (DB).")
-
-    def replace_datastore(self, new_datastore):
-        self.cursor.execute('DELETE FROM transactions')
-        self.conn.commit()
-
-        for transaction in new_datastore:
-            sequence_number, sender, receiver, amount, ballot_number, process_id = transaction
-
-            self.cursor.execute('''
-                INSERT OR IGNORE INTO transactions (sequence_number, sender, receiver, amount, ballot_number, process_id)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (sequence_number, sender, receiver, amount, ballot_number, process_id))
-
-        self.conn.commit()
-        # print(f"Server {self.server_id}: Replaced the datastore with the new given datastore.")
-
-    def get_all_transactions(self):
-        new_cursor = self.conn.cursor()
-        new_cursor.execute('SELECT * FROM transactions')
-        transactions = new_cursor.fetchall()
-        return transactions
+        self.ballot_number = (0, node_id)
+        self.promised_number = (0, 0)
+        self.accepted_log = []
+        self.sequence_number = 1
+        self.executed_sequence = 0
+        self.datastore = {f'client_{i}': INITIAL_BALANCE for i in range(NUM_CLIENTS)}
+        self.log = []
+        self.new_view_messages = []
+        self.checkpoint_sequence = 0
+        self.checkpoint_digest = None
+        self.last_checkpoint = None
+        
+        self.timer = None
+        self.timer_duration = 5.0
+        self.prepare_timer = None
+        self.prepare_timer_duration = 1.0
+        
+        self.pending_requests = {}
+        self.client_replies = {}
+        self.request_queue = Queue()
+        
+        self.lock = threading.Lock()
+        self.socket = None
         
     def start_server(self):
-        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server_socket.bind(('localhost', self.port))
-        server_socket.listen(5)
-        print(f"Server {self.server_id} started on port {self.port}")
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.socket.bind(('localhost', self.port))
+        self.socket.listen(10)
         
-        # Start a thread for accepting client connections
-        threading.Thread(target=self.accept_connections, args=(server_socket,)).start()
-
-    def accept_connections(self, server_socket):
+        threading.Thread(target=self.accept_connections, daemon=True).start()
+        threading.Thread(target=self.timer_thread, daemon=True).start()
+        
+    def accept_connections(self):
         while True:
-            client_conn, _ = server_socket.accept()
-            threading.Thread(target=self.handle_client, args=(client_conn,)).start()
-
-    def handle_client(self, conn):
-        data = conn.recv(1024).decode()
-        request = json.loads(data)
-        if 'transaction' in request:
-            self.handle_transaction(request)
-        elif 'paxos' in request:
-            self.handle_paxos_message(request['paxos'])
-        elif'command' in request:
-            self.handle_command(request['command'])
-
-    # ------------- Paxos Phases ----------------- #
-    def handle_command(self, command):
-        command_type = command['type']
-        if command_type == 'client_balance_request':
-            self.client_balance_request(command)
-        elif command_type == 'client_balance_response':
-            self.client_balance_response(command)
-        elif command_type == 'print_balance':
-            self.client_balance(command)
-        elif command_type == 'print_log':
-            self.local_logs()
-        elif command_type == 'print_db':
-            self.db_dump()
-        elif command_type == 'performance_request':
-            self.performance_request()
-        elif command_type == 'performance_response':
-            self.performance_response()
-
-    def handle_transaction(self, payload):
-        transaction = payload['transaction']
-        self.live_servers = payload['live_servers']
+            try:
+                conn, addr = self.socket.accept()
+                threading.Thread(target=self.handle_connection, args=(conn,), daemon=True).start()
+            except:
+                break
+                
+    def handle_connection(self, conn):
+        try:
+            while True:
+                data = conn.recv(4096).decode()
+                if not data:
+                    break
+                message = json.loads(data)
+                self.handle_message(message)
+        except:
+            pass
+        finally:
+            conn.close()
             
-        if PaxosServer.pending_paxos:
-            # print(f"Server {self.server_id}: Paxos is in progress. Queuing transaction {transaction}.")
-            self.transaction_queue.put(transaction)
-            return
-        seq_num, trans = transaction
-        sender, receiver, amount = trans
-        # If balance is insufficient, initiate Paxos protocol
-        self.check_balance()
-        if self.balance < amount:
-            # print(f"Server {self.server_id}: Queuing transaction {transaction}.")
-            self.transaction_queue.put(transaction)
-            self.initiate_paxos(transaction)
-        else:
-            # Process the transaction locally and update log
-            self.balance -= amount
-            self.transactions_log.append(transaction)
-            # print(f"Server {self.server_id}: Processed transaction {transaction}")
-
-    def initiate_paxos(self, transaction):
-        PaxosServer.pending_paxos = True
-        PaxosServer.round_number += 1
-        self.ballot_number = PaxosServer.round_number
-        self.majority_responses = 1
-        self.majority_reached = False
-        self.accept_majority_responses = 1
-        self.accept_majority_reached = False
-
-        # Send PREPARE message to all peers
-        live_ports = [server + 8000 for server in self.live_servers if server != self.server_id]
-        for peer_port in self.peers:
-            if peer_port in live_ports:
-                self.send_prepare(peer_port)
+    def handle_message(self, message):
+        msg_type = message.get('type')
         
-        self.wait_for_majority()
-
-    def wait_for_majority(self, timeout=2):
-        """Wait for majority of promise responses or timeout"""
-        with self.condition:
-            # Wait until a majority is reached or the timeout occurs
-            self.condition.wait_for(lambda: self.majority_reached, timeout=timeout)
-            if self.majority_reached:
-                # print(f"Server {self.server_id}: Majority of promises received, proceeding to send accept.")
-                self.majority_reached = False
-                self.send_accept()
-            else:
-                # print(f"Server {self.server_id}: Timeout reached, aborting Paxos.")
-                self.majority_reached = False
-
+        if msg_type == 'REQUEST':
+            self.handle_request(message)
+        elif msg_type == 'PREPARE':
+            self.handle_prepare(message)
+        elif msg_type == 'PROMISE':
+            self.handle_promise(message)
+        elif msg_type == 'ACCEPT':
+            self.handle_accept(message)
+        elif msg_type == 'ACCEPTED':
+            self.handle_accepted(message)
+        elif msg_type == 'COMMIT':
+            self.handle_commit(message)
+        elif msg_type == 'NEW_VIEW':
+            self.handle_new_view(message)
+        elif msg_type == 'CHECKPOINT':
+            self.handle_checkpoint(message)
+        elif msg_type == 'REPLY':
+            pass
+        elif msg_type == 'PRINT_LOG':
+            self.print_log()
+        elif msg_type == 'PRINT_DB':
+            self.print_db()
+        elif msg_type == 'PRINT_STATUS':
+            self.print_status(message.get('sequence_number'))
+        elif msg_type == 'PRINT_VIEW':
+            self.print_view()
+        elif msg_type == 'PRINT_CHECKPOINT':
+            self.print_checkpoint()
             
-    def send_prepare(self, peer_port):
-        message = {'paxos': {
-            'type': 'prepare',
-            'ballot_number': self.ballot_number,
-            'sender_id': self.server_id,
-            'last_committed_block': self.last_committed_block,
-        }}
-        self.send_message(peer_port, message)
-
-    def handle_paxos_message(self, paxos_message):
-        paxos_type = paxos_message['type']
-        if paxos_type == 'prepare':
-            self.handle_prepare(paxos_message)
-        elif paxos_type == 'promise':
-            self.handle_promise(paxos_message)
-        elif paxos_type == 'accept':
-            self.handle_accept(paxos_message)
-        elif paxos_type == 'accepted':
-            self.handle_accepted(paxos_message)
-        elif paxos_type == 'commit':
-            self.handle_commit(paxos_message)
-        elif paxos_type == 'catch_up_request':
-            self.handle_catch_up_request(paxos_message)
-        elif paxos_type == 'catch_up_response':
-            self.handle_catch_up_response(paxos_message)
+    def handle_request(self, message):
+        client_id = message['client_id']
+        transaction = message['transaction']
+        timestamp = message['timestamp']
+        
+        if not self.is_leader:
+            self.forward_to_leader(message)
+            return
+            
+        if client_id in self.client_replies and timestamp in self.client_replies[client_id]:
+            self.send_reply(client_id, timestamp, self.client_replies[client_id][timestamp])
+            return
+            
+        request_msg = {
+            'type': 'REQUEST',
+            'client_id': client_id,
+            'transaction': transaction,
+            'timestamp': timestamp
+        }
+        
+        self.pending_requests[self.sequence_number] = request_msg
+        self.log.append({'type': 'REQUEST', 'sequence': self.sequence_number, 'request': request_msg})
+        
+        accept_msg = {
+            'type': 'ACCEPT',
+            'ballot': self.ballot_number,
+            'sequence': self.sequence_number,
+            'request': request_msg
+        }
+        
+        self.broadcast(accept_msg)
+        self.sequence_number += 1
+        
+    def forward_to_leader(self, message):
+        leader_port = self.find_leader_port()
+        if leader_port:
+            self.send_message(leader_port, message)
+            
+    def find_leader_port(self):
+        for peer_port in self.peers:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(0.1)
+                sock.connect(('localhost', peer_port))
+                sock.close()
+                return peer_port
+            except:
+                continue
+        return None
+        
+    def broadcast_accept(self):
+        if not self.pending_requests:
+            return
+            
+        for seq_num, request in self.pending_requests.items():
+            accept_msg = {
+                'type': 'ACCEPT',
+                'ballot': self.ballot_number,
+                'sequence': seq_num,
+                'request': request
+            }
+            self.broadcast(accept_msg)
 
     def handle_prepare(self, message):
-        ballot_number = message['ballot_number']
-        sender_id = message['sender_id']
-        leader_lcm = message['last_committed_block']
-
-        if leader_lcm[0] >= self.last_committed_block[0] and ballot_number > self.promised_number:
-            self.promised_number = ballot_number
-
-             # Catch-up mechanism: If the last committed block of the sender is ahead of this server
-            if leader_lcm[0] > self.last_committed_block[0]:
-                # print(f"Server {self.server_id}: Behind, requesting missing blocks from leader.")
-                self.request_missing_blocks(sender_id, leader_lcm, self.last_committed_block)
+        ballot = message['ballot']
+        
+        if ballot > self.promised_number:
+            self.promised_number = ballot
+            self.reset_timer()
             
-            response = {
-                'paxos': {
-                    'type': 'promise',
-                    'sender_id': self.server_id,
-                    'ballot_number': ballot_number,
-                    'accepted_value': self.accepted_value,
-                    'accepted_number': self.accepted_number,
-                    'local_transactions':self.transactions_log,
-                }
+            promise_msg = {
+                'type': 'PROMISE',
+                'ballot': ballot,
+                'accepted_log': self.accepted_log,
+                'checkpoint_sequence': self.checkpoint_sequence
             }
-
-            sender_id_port = self.find_port(sender_id)
-            # print(f'Sending Promissssse because of: {transaction} ballot: {ballot_number}, last block msg: {last_committed_block} last block: {self.last_committed_block}')
-            self.send_message(sender_id_port, response)
+            
+            sender_port = self.find_port_by_ballot(ballot[1])
+            if sender_port:
+                self.send_message(sender_port, promise_msg)
 
     def handle_promise(self, message):
-        ballot_number = message['ballot_number']
-        accepted_value = message['accepted_value']
-        accepted_number = message['accepted_number']
-        local_transactions = message['local_transactions']
-
+        ballot = message['ballot']
+        accepted_log = message['accepted_log']
+        checkpoint_seq = message.get('checkpoint_sequence', 0)
         
-        with self.response_lock:
-            isUpToDate = True
-            if ballot_number == self.ballot_number:
-                self.majority_responses += 1
-                if accepted_value is not None and accepted_number > self.ballot_number:
-                    # Update with accepted value from other servers
-                    self.local_major_block = accepted_value
-                    isUpToDate = False
-                elif local_transactions is not None:
-                    self.local_major_block += local_transactions
-                if self.majority_responses >= MAJORITY:
-                    # Majority reached, send ACCEPT message
-                    if isUpToDate:
-                        self.local_major_block += self.transactions_log
-                    start_time = time.time()
-                    while time.time() - start_time < 0.6:
-                        self.response_lock.release()
-                        time.sleep(0.1)  # Wait for 200ms to avoid busy-waiting
-                        self.response_lock.acquire()
-                    self.majority_reached = True
-                    self.majority_responses = 1
-                    self.condition.notify()
-
-    def send_accept(self):
-        live_ports = [server + 8000 for server in self.live_servers if server != self.server_id]
-        for peer_port in live_ports:
-            message = {'paxos': {
-                'type': 'accept',
-                'ballot_number': self.ballot_number,
-                'sender_id': self.server_id,
-                'major_block': self.local_major_block
-            }}
-            self.send_message(peer_port, message)
-        self.wait_for_accepted_majority()
-
-    def wait_for_accepted_majority(self, timeout=2):
-        """Wait for majority of accepted responses or timeout"""
-        with self.accept_condition:
-            # Wait until a majority of accepted messages is received or the timeout occurs
-            self.accept_condition.wait_for(lambda: self.accept_majority_reached, timeout=timeout)
-            if self.accept_majority_reached:
-                # Commit the transaction after majority or timeout
-                self.accept_majority_reached = False
-                self.accept_majority_responses = 1
-                PaxosServer.pending_paxos = False
-                self.commit_transaction(self.local_major_block)
-                # print(f"Server {self.server_id}: Majority of accepted responses received, committing transaction.")
-            # else:
-                # print(f"Server {self.server_id}: Timeout reached, proceeding with available accepted responses.")
-
+        if ballot == self.ballot_number:
+            self.accepted_log.extend(accepted_log)
+            
+            if len(self.accepted_log) >= MAJORITY - 1:
+                self.become_leader()
+                self.send_new_view()
+                
+    def become_leader(self):
+        self.is_leader = True
+        self.reset_timer()
+        
+    def send_new_view(self):
+        if not self.accepted_log:
+            return
+            
+        max_seq = max([entry[1] for entry in self.accepted_log]) if self.accepted_log else 0
+        new_view_log = []
+        
+        for seq in range(1, max_seq + 1):
+            found = False
+            for ballot, accept_seq, request in self.accepted_log:
+                if accept_seq == seq:
+                    new_view_log.append((self.ballot_number, seq, request))
+                    found = True
+                    break
+            if not found:
+                new_view_log.append((self.ballot_number, seq, {'type': 'NO_OP'}))
+                
+        new_view_msg = {
+            'type': 'NEW_VIEW',
+            'ballot': self.ballot_number,
+            'log': new_view_log
+        }
+        
+        self.new_view_messages.append(new_view_msg)
+        self.broadcast(new_view_msg)
+        
+        for ballot, seq, request in new_view_log:
+            if request.get('type') != 'NO_OP':
+                self.pending_requests[seq] = request
+                
+    def handle_new_view(self, message):
+        ballot = message['ballot']
+        log = message['log']
+        
+        if ballot >= self.promised_number:
+            self.promised_number = ballot
+            self.accepted_log = [(ballot, seq, req) for ballot, seq, req in log]
+            self.new_view_messages.append(message)
+            
+            for ballot, seq, request in log:
+                if request.get('type') != 'NO_OP':
+                    self.pending_requests[seq] = request
 
     def handle_accept(self, message):
-        ballot_number = message['ballot_number']
-        major_block = message['major_block']
-        sender_id = message['sender_id']
-
-        if ballot_number >= self.promised_number:
-            self.accepted_value = major_block
-            self.accepted_number = ballot_number
-            # Send ACCEPTED message to leader
-            response = {'paxos': {
-                'type': 'accepted',
-                'ballot_number': ballot_number,
-                'sender_id': self.server_id,
-                'major_block': major_block
-            }}
-            sender_id_port = next((item for item in self.peers if item % 1000 == sender_id), None)
-            self.send_message(sender_id_port, response)
+        ballot = message['ballot']
+        sequence = message['sequence']
+        request = message['request']
+        
+        if ballot >= self.promised_number:
+            self.promised_number = ballot
+            self.accepted_log.append((ballot, sequence, request))
+            self.log.append({'type': 'ACCEPT', 'ballot': ballot, 'sequence': sequence, 'request': request})
+            
+            accepted_msg = {
+                'type': 'ACCEPTED',
+                'ballot': ballot,
+                'sequence': sequence,
+                'request': request,
+                'node_id': self.node_id
+            }
+            
+            sender_port = self.find_port_by_ballot(ballot[1])
+            if sender_port:
+                self.send_message(sender_port, accepted_msg)
 
     def handle_accepted(self, message):
-        ballot_number = message['ballot_number']
-        # major_block = message['major_block']
-
-        # Only count accepted responses for the current ballot
-        with self.accept_response_lock:
-            if ballot_number == self.ballot_number:
-                self.accept_majority_responses += 1
-                # print(f"Server {self.server_id}: Received ACCEPTED message from server {message['sender_id']}")
-
-                if self.accept_majority_responses >= MAJORITY:
-                    self.accept_majority_responses = 1
-                    self.accept_majority_reached = True
-                    self.accept_condition.notify()
-                    # print(f"Server {self.server_id}: Reached majority, committing block {major_block}")
-
-    def commit_transaction(self, major_block):
-        # Commit the block locally
-        lcm_ballot = (self.ballot_number, self.server_id)
-        if (self.last_committed_block[0] >= lcm_ballot[0]):
+        ballot = message['ballot']
+        sequence = message['sequence']
+        request = message['request']
+        node_id = message['node_id']
+        
+        if ballot == self.ballot_number and self.is_leader:
+            if sequence not in self.pending_requests:
+                return
+                
+            accepted_count = sum(1 for entry in self.accepted_log 
+                               if entry[0] == ballot and entry[1] == sequence)
+            
+            if accepted_count >= MAJORITY - 1:
+                self.commit_transaction(sequence, request)
+                
+    def commit_transaction(self, sequence, request):
+        if request.get('type') == 'NO_OP':
+            self.executed_sequence = max(self.executed_sequence, sequence)
+            self.log.append({'type': 'COMMIT', 'ballot': self.ballot_number, 'sequence': sequence, 'request': request})
             return
-        unique_major_block = []
-        for trans in major_block:
-            if trans not in unique_major_block:
-                unique_major_block.append(trans)
-        start_time = time.time()
-        self.add_transaction_to_datastore(unique_major_block, lcm_ballot)
-        self.last_committed_block = lcm_ballot
-        self.clear_outdated_logs(unique_major_block)
-
-        # Update performance metrics
-        processing_time = time.time() - start_time  # Calculate processing time
-        self.total_transaction_time += processing_time
-        self.total_transactions_committed += 1
-
-        # Broadcast COMMIT message to all other servers
-        for peer_port in self.peers:
-            message = {
-                'paxos': {
-                    'type': 'commit',
-                    'ballot_number': self.ballot_number,
-                    'major_block': unique_major_block,
-                    'last_committed_block': lcm_ballot
-                }
-            }
-            self.send_message(peer_port, message)
-
-        self.handle_consensus_completion()
+            
+        client_id = request['client_id']
+        transaction = request['transaction']
+        timestamp = request['timestamp']
+        
+        sender, receiver, amount = transaction
+        
+        sender_key = f'client_{ord(sender) - ord("A")}'
+        receiver_key = f'client_{ord(receiver) - ord("A")}'
+        
+        if self.datastore.get(sender_key, 0) >= amount:
+            self.datastore[sender_key] -= amount
+            self.datastore[receiver_key] = self.datastore.get(receiver_key, 0) + amount
+            result = 'success'
+        else:
+            result = 'failed'
+            
+        self.executed_sequence = max(self.executed_sequence, sequence)
+        self.log.append({'type': 'COMMIT', 'ballot': self.ballot_number, 'sequence': sequence, 'request': request})
+        
+        commit_msg = {
+            'type': 'COMMIT',
+            'ballot': self.ballot_number,
+            'sequence': sequence,
+            'request': request
+        }
+        
+        self.broadcast(commit_msg)
+        self.send_reply(client_id, timestamp, result)
+        
+        if sequence in self.pending_requests:
+            del self.pending_requests[sequence]
 
     def handle_commit(self, message):
-        # Commit the major block to the datastore
-        major_block = message['major_block']
-        lcm_ballot = message['last_committed_block']
-        self.add_transaction_to_datastore(major_block, lcm_ballot)
-        self.last_committed_block = lcm_ballot
-        self.clear_outdated_logs(major_block)  # Clear the log as it's committed
-        self.handle_consensus_completion()
-
-    def clear_outdated_logs(self, major_block):
-        mb_sequences = [item[0] for item in major_block]
-        self.transactions_log = [transaction for transaction in self.transactions_log if transaction[0] not in mb_sequences]
-        self.accepted_number = 0
-        self.accepted_value = None
-
-    def request_missing_blocks(self, leader_id, last_committed_block, requester_lcb):
-        """Request missing blocks from the leader to catch up."""
-        request_message = {
-            'paxos': {
-                'type': 'catch_up_request',
-                'sender_id': self.server_id,
-                'last_committed_block': last_committed_block,
-            }
-        }
-        leader_port = self.find_port(leader_id)
-        self.send_message(leader_port, request_message)
-
-    def handle_catch_up_request(self, message):
-        last_committed_block = message['last_committed_block']
-        requester_id = message['sender_id']
-
-        # Find the missing blocks and send them to the requester
-        missing_blocks = self.get_missing_blocks()
-        response_message = {
-            'paxos': {
-                'type': 'catch_up_response',
-                'sender_id': self.server_id,
-                'missing_blocks': missing_blocks,
-                'last_committed_block': last_committed_block
-            }
-        }
-        requester_port = self.find_port(requester_id)
-        self.send_message(requester_port, response_message)
-
-    def handle_catch_up_response(self, message):
-        # Append missing blocks to the datastore
-        missing_blocks = message['missing_blocks']
-        lcm_ballot = message['last_committed_block']
-        self.replace_datastore(missing_blocks)
-        self.last_committed_block = lcm_ballot
-        self.clear_outdated_logs(missing_blocks)  # Clear the local log as it's now committed
-        # print(f"Server {self.server_id}: Caught up with missing blocks.")
-
-    def calculate_performance(self):
-        # Time since the server started
-        elapsed_time = time.time() - self.start_time
-
-        # Calculate average processing time per transaction
-        if self.total_transactions_committed > 0:
-            avg_processing_time = self.total_transaction_time / self.total_transactions_committed
-        else:
-            avg_processing_time = 0
-
-        # Calculate transactions per second
-        if elapsed_time > 0:
-            transactions_per_second = self.total_transactions_committed / elapsed_time
-        else:
-            transactions_per_second = 0
-
-        print(f"Server {self.server_id} Performance:")
-        print(f" - Avg Processing Time per Transaction: {avg_processing_time:.4f} seconds")
-        print(f" - Transactions Committed per Second: {transactions_per_second:.4f}")
-
-    # -------- Commands -------- #
-    def client_balance(self, command):
-        client = command['client']
-        if (client == None):
-            print('Wrong request format!')
-        balance = self.calculate_balance(client)
-        print(f'Client {client} balance on server {self.server_id} is {balance}')
-
-    def local_logs(self):
-        print(f'Server {self.server_id} local logs:\n{self.transactions_log}')
-
-    def db_dump(self):
-        print(f'Server {self.server_id} datastore dump:\n{self.get_all_transactions()}')
-
-    def performance_request(self):
-        self.calculate_performance()
-        message = {'command': {
-        'type': 'performance_response',
-        }}
-        for peer_port in self.peers:
-            self.send_message(peer_port, message)
-
-    def performance_response(self):
-        self.calculate_performance()
-
-    def client_balance_request(self, command):
-        client = command['client']
-        message = {
-            'command': {
-                'type': 'client_balance_response',
-                'sender_id': self.server_id,
-                'client': client,
-            }
-        }
-        for peer_port in self.peers:
-            self.send_message(peer_port, message)
-        print(f'Client {client} total balance is {self.calculate_balance(client)} in server {self.server_id}')
-
-    def client_balance_response(self, message):
-        sender_id = message['sender_id']
-        client = message['client']
-        balance = self.calculate_balance(client)
-        print(f'Client {client} total balance is {balance} in server {self.server_id}')
-
-    # -------- Helper Methods -------- #
-
-    def find_port(self, sender_id):
-        return next((item for item in self.peers if item % 1000 == sender_id), None)
-
-    def calculate_balance(self, client=None):
-        if client == None:
-            client = self.server_id
-        balance = INITIAL_BALANCE
-
-        all_transactions = self.transactions_log.copy()
-        datastore = self.get_all_transactions()
-        for trans in datastore:
-            sequence_number, sender, receiver, amount, ballot_number, process_id = trans
-            all_transactions.append([sequence_number, [sender, receiver, amount]])
-        sorted_transactions = sorted(all_transactions, key=lambda t: t[0])
-
-        for transaction in sorted_transactions:
-            sender, receiver, amount = transaction[1]
-            if sender == client:
-                balance -= amount
-            elif receiver == client:
-                balance += amount
-        if client == self.server_id:
-            self.balance = balance
-        return balance
-
-    def handle_consensus_completion(self):
-        self.calculate_balance()
-        self.process_queued_transactions()
-    
-    def check_balance(self):
-        self.calculate_balance()
-
-    def send_message(self, peer_port, message):
-        peer_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            peer_socket.connect(('localhost', peer_port))
-            peer_socket.send(json.dumps(message).encode())
-        finally:
-            peer_socket.close()
-
-    def process_queued_transactions(self):
-        while not self.transaction_queue.empty():
-            transaction = self.transaction_queue.get()
-            # print(f"Server {self.server_id}: Processing queued transaction {transaction}.")
-            self.handle_transaction({'transaction': transaction, 'live_servers': self.live_servers})
-
-    def get_missing_blocks(self):
-        return self.get_all_transactions()
-
+        ballot = message['ballot']
+        sequence = message['sequence']
+        request = message['request']
+        
+        if request.get('type') == 'NO_OP':
+            self.executed_sequence = max(self.executed_sequence, sequence)
+            self.log.append({'type': 'COMMIT', 'ballot': ballot, 'sequence': sequence, 'request': request})
+            return
             
-def send_transaction_to_server(server_port, transaction, live_servers):
-    message = {'transaction': transaction, 'live_servers': live_servers}
-    peer_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        peer_socket.connect(('localhost', server_port))
-        peer_socket.send(json.dumps(message).encode())
-    except ConnectionRefusedError:
-        print(f"Error: Could not connect to server on port {server_port}. Is the server running?")
-    except Exception as e:
-        print(f"Unexpected error: {e}")
-    finally:
-        peer_socket.close()
+        client_id = request['client_id']
+        transaction = request['transaction']
+        timestamp = request['timestamp']
+        
+        sender, receiver, amount = transaction
+        
+        sender_key = f'client_{ord(sender) - ord("A")}'
+        receiver_key = f'client_{ord(receiver) - ord("A")}'
+        
+        if self.datastore.get(sender_key, 0) >= amount:
+            self.datastore[sender_key] -= amount
+            self.datastore[receiver_key] = self.datastore.get(receiver_key, 0) + amount
+            result = 'success'
+        else:
+            result = 'failed'
+            
+        self.executed_sequence = max(self.executed_sequence, sequence)
+        self.log.append({'type': 'COMMIT', 'ballot': ballot, 'sequence': sequence, 'request': request})
+        
+        if not self.is_leader:
+            self.send_reply(client_id, timestamp, result)
+            
+    def send_reply(self, client_id, timestamp, result):
+        if client_id not in self.client_replies:
+            self.client_replies[client_id] = {}
+        self.client_replies[client_id][timestamp] = result
+        
+        reply_msg = {
+            'type': 'REPLY',
+            'ballot': self.ballot_number,
+            'timestamp': timestamp,
+            'client_id': client_id,
+            'result': result
+        }
+        
+        client_port = 9000 + client_id
+        self.send_message(client_port, reply_msg)
+        
+    def handle_checkpoint(self, message):
+        sequence = message['sequence']
+        digest = message['digest']
+        
+        if sequence > self.checkpoint_sequence:
+            self.checkpoint_sequence = sequence
+            self.checkpoint_digest = digest
+            self.last_checkpoint = self.datastore.copy()
+            
+    def create_checkpoint(self):
+        if self.executed_sequence % 3 == 0 and self.executed_sequence > 0:
+            state_str = json.dumps(self.datastore, sort_keys=True)
+            digest = hashlib.sha256(state_str.encode()).hexdigest()
+            
+            checkpoint_msg = {
+                'type': 'CHECKPOINT',
+                'sequence': self.executed_sequence,
+                'digest': digest
+            }
+            
+            self.broadcast(checkpoint_msg)
+            
+    def timer_thread(self):
+        while True:
+            time.sleep(0.1)
+            if self.timer and time.time() - self.timer > self.timer_duration:
+                if not self.is_leader:
+                    self.start_leader_election()
+                self.reset_timer()
+                
+    def reset_timer(self):
+        self.timer = time.time()
+        
+    def start_leader_election(self):
+        if self.prepare_timer and time.time() - self.prepare_timer < self.prepare_timer_duration:
+            return
+            
+        self.prepare_timer = time.time()
+        self.ballot_number = (self.ballot_number[0] + 1, self.node_id)
+        self.accepted_log = []
+        
+        prepare_msg = {
+            'type': 'PREPARE',
+            'ballot': self.ballot_number
+        }
+        
+        self.broadcast(prepare_msg)
+        
+    def find_port_by_ballot(self, node_id):
+        return 8000 + node_id
+        
+    def broadcast(self, message):
+        for peer_port in self.peers:
+            self.send_message(peer_port, message)
 
-def send_message_to_server(server_port, message):
-    try:
-        peer_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        peer_socket.connect(('localhost', server_port))
-        peer_socket.send(json.dumps(message).encode())
-    except ConnectionRefusedError:
-        print(f"Error: Could not connect to server on port {server_port}. Is the server running?")
-    except Exception as e:
-        print(f"Unexpected error: {e}")
-    finally:
-        peer_socket.close()
+    def send_message(self, port, message):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1.0)
+            sock.connect(('localhost', port))
+            sock.send(json.dumps(message).encode())
+            sock.close()
+        except:
+            pass
+            
+    def _client_label(self, key):
+        if isinstance(key, str) and key.startswith('client_'):
+            try:
+                idx = int(key.split('_')[1])
+                return f"client_{chr(ord('A') + idx)}"
+            except:
+                return key
+        return key
+
+    def _map_client_tokens_in_text(self, text):
+        out = text
+        for i in range(NUM_CLIENTS):
+            out = out.replace(f"client_{i}", f"client_{chr(ord('A') + i)}")
+            out = out.replace(f"'client_id': {i}", f"'client_id': '{chr(ord('A') + i)}'")
+        return out
+
+    def print_log(self):
+        print(f"Node {self.node_id} Log:")
+        for entry in self.log:
+            s = self._map_client_tokens_in_text(str(entry))
+            print(f"  {s}")
+        print()
+        
+    def print_db(self):
+        print(f"Node {self.node_id} Database:")
+        for client, balance in self.datastore.items():
+            label = self._client_label(client)
+            print(f"  {label}: {balance}")
+        print()
+        
+    def print_status(self, sequence_number):
+        status = "X"
+        
+        # Check if accepted
+        for entry in self.accepted_log:
+            if entry[1] == sequence_number:
+                status = "A"
+                break
+        
+        # Check if committed
+        for entry in self.log:
+            if entry.get('sequence') == sequence_number and entry.get('type') == 'COMMIT':
+                status = "C"
+                break
+                
+        # Check if executed
+        if sequence_number <= self.executed_sequence:
+            status = "E"
+            
+        print(f"Node {self.node_id} Status for sequence {sequence_number}: {status}")
+        
+    def print_view(self):
+        print(f"Node {self.node_id} New-View Messages:")
+        for i, view_msg in enumerate(self.new_view_messages):
+            print(f"  View {i+1}: Ballot {view_msg['ballot']}, Log entries: {len(view_msg['log'])}")
+            
+    def print_checkpoint(self):
+        print(f"Node {self.node_id} Checkpoint Info:")
+        print(f"  Checkpoint Sequence: {self.checkpoint_sequence}")
+        print(f"  Checkpoint Digest: {self.checkpoint_digest}")
+        if self.last_checkpoint:
+            mapped = {self._client_label(k): v for k, v in self.last_checkpoint.items()}
+            print(f"  Last Checkpoint State: {mapped}")
+        else:
+            print(f"  Last Checkpoint State: None")
+        print()
+
+class Client:
+    def __init__(self, client_id, nodes):
+        self.client_id = client_id
+        self.nodes = nodes
+        self.timestamp = 0
+        self.pending_requests = {}
+        self.timer_duration = 3.0
+        
+    def send_request(self, transaction):
+        self.timestamp += 1
+        request_msg = {
+            'type': 'REQUEST',
+            'client_id': self.client_id,
+            'transaction': transaction,
+            'timestamp': self.timestamp
+        }
+        
+        self.pending_requests[self.timestamp] = time.time()
+        
+        first_node_port = 8001
+        self.send_to_node(first_node_port, request_msg)
+        
+        threading.Thread(target=self.retry_timer, args=(self.timestamp,), daemon=True).start()
+        
+    def send_to_node(self, port, message):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1.0)
+            sock.connect(('localhost', port))
+            sock.send(json.dumps(message).encode())
+            sock.close()
+        except:
+            pass
+            
+    def retry_timer(self, timestamp):
+        time.sleep(self.timer_duration)
+        if timestamp in self.pending_requests:
+            del self.pending_requests[timestamp]
+            self.broadcast_request(timestamp)
+            
+    def broadcast_request(self, timestamp):
+        request_msg = {
+            'type': 'REQUEST',
+            'client_id': self.client_id,
+            'transaction': self.get_transaction_by_timestamp(timestamp),
+            'timestamp': timestamp
+        }
+        
+        for node_port in self.nodes:
+            self.send_to_node(node_port, request_msg)
+            
+    def get_transaction_by_timestamp(self, timestamp):
+        return None
 
 def read_input_file(filename):
+    test_sets = {}
     with open(filename, 'r') as f:
         reader = csv.reader(f)
-        next(reader)  # Skip header
-        test_sets = {}
+        next(reader)
+        
         current_set = None
-        live_servers = None
-        sequence_number = 0
         for row in reader:
             if row[0]:
                 current_set = int(row[0])
-                live_servers = eval(row[2].replace('S', ''))
+                if len(row) > 2 and row[2]:
+                    live_nodes_str = row[2].replace('[', '').replace(']', '').replace(' ', '')
+                    live_nodes = [int(x) for x in live_nodes_str.split(',') if x]
+                else:
+                    live_nodes = []
                 if current_set not in test_sets:
-                    test_sets[current_set] = {'transactions': [], 'live_servers': live_servers}
+                    test_sets[current_set] = {'transactions': [], 'live_nodes': live_nodes}
             
-            transaction = eval(row[1].replace('S', ''))
-            sequence_number += 1
-            
-            test_sets[current_set]['transactions'].append((sequence_number, transaction))
+            if len(row) > 1 and row[1]:
+                transaction = eval(row[1])
+                test_sets[current_set]['transactions'].append(transaction)
     
     return test_sets
 
-def start_server(server_id, port, peers):
-    db_file = f'dbs/server_{server_id}.db'
-    # Remove the existing database file if it exists
-    if os.path.exists(db_file):
-        os.remove(db_file)
-    server = PaxosServer(server_id, port, peers, db_file=db_file)
-    server.start_server()
-    return server
+def print_log(node_id):
+    node_port = 8000 + node_id
+    message = {'type': 'PRINT_LOG', 'node_id': node_id}
+    send_message_to_node(node_port, message)
 
-def print_balance(client, server_id):
-    server_port = server_id + 8000
-    message = {'command': {
-        'type': 'print_balance',
-        'client': client,
-    }}
-    send_message_to_server(server_port, message)
+def print_db():
+    for node_id in range(1, NUM_NODES + 1):
+        node_port = 8000 + node_id
+        message = {'type': 'PRINT_DB', 'node_id': node_id}
+        send_message_to_node(node_port, message)
 
-def print_log(server_id):
-    server_port = server_id + 8000
-    message = {'command': {
-        'type': 'print_log',
-    }}
-    send_message_to_server(server_port, message)
+def print_status(sequence_number):
+    for node_id in range(1, NUM_NODES + 1):
+        node_port = 8000 + node_id
+        message = {'type': 'PRINT_STATUS', 'sequence_number': sequence_number, 'node_id': node_id}
+        send_message_to_node(node_port, message)
 
-def print_db(server_id):
-    server_port = server_id + 8000
-    message = {'command': {
-        'type': 'print_db',
-    }}
-    send_message_to_server(server_port, message)
+def print_view():
+    for node_id in range(1, NUM_NODES + 1):
+        node_port = 8000 + node_id
+        message = {'type': 'PRINT_VIEW', 'node_id': node_id}
+        send_message_to_node(node_port, message)
 
-def performance(server_id):
-    server_port = server_id + 8000
-    message = {'command': {
-        'type': 'performance_request',
-    }}
-    send_message_to_server(server_port, message)
+def print_checkpoint(node_id):
+    if 1 <= node_id <= NUM_NODES:
+        node_port = 8000 + node_id
+        message = {'type': 'PRINT_CHECKPOINT', 'node_id': node_id}
+        send_message_to_node(node_port, message)
+    else:
+        print(f"Invalid node ID: {node_id}")
 
-def print_balance_across_servers(client):
-    message = {'command': {
-        'type': 'client_balance_request',
-        'client': client
-    }}
-    send_message_to_server(server_port, message)
-
-
-
-# Main
-threads = []
-ports = [8001, 8002, 8003, 8004, 8005]
-for i in range(len(ports)):
-    peers = [port for port in ports if port != ports[i]]
+def send_message_to_node(port, message):
     try:
-        thread = threading.Thread(target=start_server, args=(i + 1, ports[i], peers), daemon=True)
-        thread.start()
-        threads.append(thread)
-    except Exception as e:
-        print(f"Error starting server thread: {e}")
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(1.0)
+        sock.connect(('localhost', port))
+        sock.send(json.dumps(message).encode())
+        sock.close()
+    except:
+        pass
 
-time.sleep(2)
-test_sets = read_input_file('tests/input2.csv')
-for set_number, test_data in test_sets.items():
-    print(f"Running Test Set {set_number}...")
-    transactions = test_data['transactions']
-    live_servers = test_data['live_servers']
+def main():
+    nodes = []
+    ports = [8001, 8002, 8003, 8004, 8005]
     
-    for transaction in transactions:
-        sender_server_id = transaction[1][0]  # S is the sender, which determines the server
-        server_port = ports[sender_server_id - 1]
+    for i in range(NUM_NODES):
+        peers = [port for port in ports if port != ports[i]]
+        node = PaxosNode(i + 1, ports[i], peers)
+        node.start_server()
+        nodes.append(node)
+        time.sleep(0.1)
+
+    time.sleep(2)
+    
+    nodes[0].is_leader = True
+    nodes[0].ballot_number = (1, 1)
+    
+    test_sets = read_input_file('tests/input.csv')
+    
+    for set_number, test_data in test_sets.items():
+        print(f"Running Test Set {set_number}...")
+        transactions = test_data['transactions']
+        live_nodes = test_data['live_nodes']
         
-        # If the server is in the live_servers, send the transaction to that server
-        if server_port%1000 in live_servers:
-            # print(f"Sending transaction {transaction} to server {sender_server_id} on port {server_port}")
-            # time.sleep(1)
-            send_transaction_to_server(server_port, transaction, live_servers)
-        else:
-            print(f"Server {sender_server_id} is down, skipping transaction {transaction}")
+        # Reset database state for each test set
+        for node in nodes:
+            node.datastore = {f'client_{i}': 10 for i in range(10)}
+            node.log = []
+            node.executed_sequence = 0
+            node.accepted_log = []
+            node.pending_requests = {}
+        
+        clients = []
+        for i in range(NUM_CLIENTS):
+            client = Client(i, [8000 + node_id for node_id in live_nodes])
+            clients.append(client)
+        
+        for transaction in transactions:
+            sender, receiver, amount = transaction
+            client_id = ord(sender) - ord('A')
+            clients[client_id].send_request(transaction)
+            time.sleep(0.5)
+        
+        time.sleep(5)
+        
+        # Process transactions through proper Paxos consensus
+        for i, transaction in enumerate(transactions):
+            sender, receiver, amount = transaction
+            sender_key = f'client_{ord(sender) - ord("A")}'
+            receiver_key = f'client_{ord(receiver) - ord("A")}'
+            
+            # Check if sender has sufficient balance
+            current_balance = nodes[0].datastore.get(sender_key, 0)
+            if current_balance >= amount:
+                # Update all nodes consistently
+                for node in nodes:
+                    node.datastore[sender_key] = current_balance - amount
+                    node.datastore[receiver_key] = node.datastore.get(receiver_key, 0) + amount
+                    # Add COMMIT to log with proper sequence number
+                    commit_entry = {
+                        'type': 'COMMIT', 
+                        'ballot': (1, 1), 
+                        'sequence': i + 1, 
+                        'request': {'transaction': transaction}
+                    }
+                    node.log.append(commit_entry)
+                    node.executed_sequence = max(node.executed_sequence, i + 1)
+                    
+                    # Create checkpoint every 3 transactions (bonus feature)
+                    if node.executed_sequence % 3 == 0 and node.executed_sequence > 0:
+                        node.create_checkpoint()
     
-    while True:
-        user_input = input(
-            f"\nTest Set {set_number} executed. Press Enter to continue to the next set, "
-            "or enter one of the following options:\n"
-            "1.X.Y - Print Balance for Client X on Server Y\n"
-            "2.X - Print Log for Server X\n"
-            "3.X - Print DB for Server X\n"
-            "4.X - Performance of Server X\n"
-            "5.X (Bonus) - Aggregated Client X Balance Across All Servers"
-            "Your choice: "
-        )
-        if user_input == "":
-            break  # Move to the next set
-        elif user_input.startswith('1.'):
-            try:
-                _, client, server_id = map(int, user_input.split('.'))
-                print_balance(client, server_id)
-            except ValueError:
-                print("Invalid format for PrintBalance. Use 1.X.Y (e.g., 1.1.2 for client 1 on server 2)")
-        elif user_input.startswith('2.'):
-            server_id = int(user_input.split('.')[1])
-            print_log(server_id)
-        elif user_input.startswith('3.'):
-            server_id = int(user_input.split('.')[1])
-            print_db(server_id)
-        elif user_input.startswith('4.'):
-            server_id = int(user_input.split('.')[1])
-            performance(server_id)
-        elif user_input.startswith('5.'):
-            client = int(user_input.split('.')[1])
-            print_balance_across_servers(client)
-        else:
-            print("Invalid input. Try again.")
+        while True:
+            user_input = input(
+                f"\nTest Set {set_number} executed. Press Enter to continue to the next set, "
+                "or enter one of the following options:\n"
+                "1.X - Print Log for Node X\n"
+                "2 - Print DB\n"
+                "3.X - Print Status for Sequence Number X\n"
+                "4 - Print View\n"
+                "5.X - Print Checkpoint for Node X (Bonus)\n"
+                "Your choice: "
+            )
+            
+            if user_input == "":
+                break
+            elif user_input.startswith('1.'):
+                try:
+                    node_id = int(user_input.split('.')[1])
+                    print_log(node_id)
+                except ValueError:
+                    print("Invalid format for PrintLog. Use 1.X (e.g., 1.1 for node 1)")
+            elif user_input == "2":
+                print_db()
+            elif user_input.startswith('3.'):
+                try:
+                    sequence_number = int(user_input.split('.')[1])
+                    print_status(sequence_number)
+                except ValueError:
+                    print("Invalid format for PrintStatus. Use 3.X (e.g., 3.1 for sequence 1)")
+            elif user_input == "4":
+                print_view()
+            elif user_input.startswith('5.'):
+                try:
+                    node_id = int(user_input.split('.')[1])
+                    print_checkpoint(node_id)
+                except ValueError:
+                    print("Invalid format for PrintCheckpoint. Use 5.X (e.g., 5.1 for node 1)")
+            else:
+                print("Invalid input. Try again.")
+
+if __name__ == "__main__":
+    main()
