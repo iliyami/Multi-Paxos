@@ -14,6 +14,14 @@ NUM_CLIENTS = 10
 INITIAL_BALANCE = 10
 MAJORITY = NUM_NODES // 2 + 1
 
+# Global debug flag
+DEBUG_MODE = False
+
+def debug_print(message):
+    """Print debug message only if debug mode is enabled"""
+    if DEBUG_MODE:
+        print(message)
+
 class PaxosNode:
     # Shared class variable to track the current leader
     leader_id = 1  # Start with node 1 as leader
@@ -50,6 +58,7 @@ class PaxosNode:
         self.processing_lock = threading.Lock()
         self.is_processing = False
         self.is_isolated = False
+        self.is_failed = False
         
         self.lock = threading.Lock()
         self.socket = None
@@ -101,8 +110,8 @@ class PaxosNode:
             self.print_checkpoint()
         elif msg_type == 'PROCESS_QUEUE':
             self.process_transaction_queue()
-        # If this node is isolated, ignore all consensus messages
-        elif self.is_isolated:
+        # If this node is isolated or failed, ignore all consensus messages
+        elif self.is_isolated or self.is_failed:
             return
         elif msg_type == 'REQUEST':
             self.handle_request(message)
@@ -122,6 +131,12 @@ class PaxosNode:
             self.handle_checkpoint(message)
         elif msg_type == 'REPLY':
             pass
+        elif msg_type == 'LEADER_FAIL':
+            self.handle_leader_failure()
+        elif msg_type == 'CATCH_UP_REQUEST':
+            self.handle_catch_up_request(message)
+        elif msg_type == 'CATCH_UP_RESPONSE':
+            self.handle_catch_up_response(message)
             
     def handle_request(self, message):
         client_id = message['client_id']
@@ -149,24 +164,31 @@ class PaxosNode:
         
     def transaction_processor(self):
         """Process transactions from the queue sequentially"""
+        debug_print(f"[DEBUG] Node {self.node_id} transaction processor started")
         while True:
             try:
                 # Wait for a transaction in the queue
                 request_msg = self.transaction_queue.get(timeout=1.0)
+                debug_print(f"[DEBUG] Node {self.node_id} processing transaction from queue: {request_msg}")
                 
                 with self.processing_lock:
                     if not self.is_leader:
                         # If we're no longer the leader, forward to current leader
+                        debug_print(f"[DEBUG] Node {self.node_id} not leader, forwarding to leader")
                         self.forward_to_leader(request_msg)
                         continue
                     
                     # Process the transaction
+                    debug_print(f"[DEBUG] Node {self.node_id} processing transaction as leader")
                     self.process_single_transaction(request_msg)
                     
                 self.transaction_queue.task_done()
                 
-            except:
-                # Timeout or other error, continue
+            except Exception as e:
+                # Timeout or other error, continue (this is normal when no transactions are queued)
+                # Only print actual errors, not timeouts
+                if "timeout" not in str(e).lower() and "empty" not in str(e).lower():
+                    debug_print(f"[DEBUG] Node {self.node_id} transaction processor error: {e}")
                 continue
                 
     def process_single_transaction(self, request_msg):
@@ -522,6 +544,196 @@ class PaxosNode:
             
             self.broadcast(checkpoint_msg)
             
+    def handle_leader_failure(self):
+        """Handle leader failure command - make node act like disconnected node"""
+        print(f"Node {self.node_id} failed (LF command received)")
+        self.is_failed = True
+        self.is_leader = False
+        self.peers = []  # Remove all peer connections
+        # Stop the timer to prevent ballot number increases
+        self.timer = None
+        
+    def recover_from_failure(self):
+        """Recover from failure when node becomes live again"""
+        print(f"Node {self.node_id} recovered from failure")
+        self.is_failed = False
+        # Timer will be reset when node becomes leader again
+        
+    def catch_up_with_peers(self, live_nodes):
+        """Catch up with peers when node becomes live again using checkpoint mechanism"""
+        debug_print(f"[DEBUG] Node {self.node_id} catch_up_with_peers called with live_nodes: {live_nodes}")
+        debug_print(f"[DEBUG] Node {self.node_id} current peers: {self.peers}")
+        debug_print(f"[DEBUG] Node {self.node_id} current state: executed_sequence={self.executed_sequence}, checkpoint_sequence={self.checkpoint_sequence}")
+        
+        if not self.peers:
+            debug_print(f"[DEBUG] Node {self.node_id} has no peers for catch-up")
+            return
+            
+        debug_print(f"[DEBUG] Node {self.node_id} starting catch-up process with peers: {self.peers}")
+        
+        # Request latest checkpoint and missing log entries from a peer
+        for peer_port in self.peers:
+            try:
+                # Request the latest checkpoint and missing log entries
+                catch_up_msg = {
+                    'type': 'CATCH_UP_REQUEST',
+                    'requester_id': self.node_id,
+                    'current_sequence': self.executed_sequence,
+                    'current_checkpoint_sequence': self.checkpoint_sequence
+                }
+                debug_print(f"[DEBUG] Node {self.node_id} attempting to send catch-up request to peer {peer_port}: {catch_up_msg}")
+                self.send_message(peer_port, catch_up_msg)
+                debug_print(f"[DEBUG] Node {self.node_id} sent catch-up request to peer {peer_port}")
+                break  # Only request from one peer
+            except Exception as e:
+                print(f"Node {self.node_id} failed to send catch-up request to peer {peer_port}: {e}")
+                continue
+                
+    def handle_catch_up_request(self, message):
+        """Handle catch-up request from a recovering node using checkpoint mechanism"""
+        requester_id = message['requester_id']
+        requester_sequence = message['current_sequence']
+        requester_checkpoint_sequence = message.get('current_checkpoint_sequence', 0)
+        
+        debug_print(f"[DEBUG] Node {self.node_id} received catch-up request from Node {requester_id}")
+        debug_print(f"[DEBUG] Requester sequence: {requester_sequence}, checkpoint: {requester_checkpoint_sequence}")
+        debug_print(f"[DEBUG] Current sequence: {self.executed_sequence}, checkpoint: {self.checkpoint_sequence}")
+        debug_print(f"[DEBUG] Node {self.node_id} has checkpoint: {self.last_checkpoint is not None}")
+        
+        # Determine the best catch-up strategy based on checkpoint availability
+        if self.checkpoint_sequence > requester_checkpoint_sequence and self.last_checkpoint:
+            # Use checkpoint-based catch-up (more efficient)
+            debug_print(f"[DEBUG] Node {self.node_id} using checkpoint-based catch-up")
+            
+            # Send checkpoint state and missing log entries after checkpoint
+            missing_logs = []
+            for log_entry in self.log:
+                if log_entry.get('sequence', 0) > self.checkpoint_sequence:
+                    missing_logs.append(log_entry)
+            
+            catch_up_response = {
+                'type': 'CATCH_UP_RESPONSE',
+                'responder_id': self.node_id,
+                'catch_up_method': 'checkpoint',
+                'checkpoint_sequence': self.checkpoint_sequence,
+                'checkpoint_digest': self.checkpoint_digest,
+                'checkpoint_state': self.last_checkpoint.copy(),
+                'missing_logs': missing_logs,
+                'current_executed_sequence': self.executed_sequence
+            }
+            debug_print(f"[DEBUG] Node {self.node_id} sending checkpoint-based response with {len(missing_logs)} missing logs")
+        else:
+            # Fall back to full state transfer
+            debug_print(f"[DEBUG] Node {self.node_id} using full state catch-up")
+            
+            # Send missing log entries and current state
+            missing_logs = []
+            for log_entry in self.log:
+                if log_entry.get('sequence', 0) > requester_sequence:
+                    missing_logs.append(log_entry)
+            
+            catch_up_response = {
+                'type': 'CATCH_UP_RESPONSE',
+                'responder_id': self.node_id,
+                'catch_up_method': 'full_state',
+                'missing_logs': missing_logs,
+                'current_datastore': self.datastore.copy(),
+                'current_executed_sequence': self.executed_sequence,
+                'current_checkpoint_sequence': self.checkpoint_sequence,
+                'current_checkpoint_digest': self.checkpoint_digest
+            }
+            debug_print(f"[DEBUG] Node {self.node_id} sending full state response with {len(missing_logs)} missing logs")
+        
+        # Send response back to requester
+        requester_port = 8000 + requester_id
+        self.send_message(requester_port, catch_up_response)
+        print(f"Node {self.node_id} sent catch-up response to Node {requester_id}")
+        
+    def handle_catch_up_response(self, message):
+        """Handle catch-up response from a peer using checkpoint mechanism"""
+        responder_id = message['responder_id']
+        catch_up_method = message.get('catch_up_method', 'full_state')
+        
+        debug_print(f"[DEBUG] Node {self.node_id} received catch-up response from Node {responder_id} using {catch_up_method}")
+        debug_print(f"[DEBUG] Node {self.node_id} before catch-up: executed_sequence={self.executed_sequence}, checkpoint_sequence={self.checkpoint_sequence}")
+        
+        if catch_up_method == 'checkpoint':
+            # Checkpoint-based catch-up
+            checkpoint_sequence = message['checkpoint_sequence']
+            checkpoint_digest = message['checkpoint_digest']
+            checkpoint_state = message['checkpoint_state']
+            missing_logs = message['missing_logs']
+            current_executed_sequence = message['current_executed_sequence']
+            
+            debug_print(f"[DEBUG] Node {self.node_id} applying checkpoint-based catch-up")
+            debug_print(f"[DEBUG] Checkpoint sequence: {checkpoint_sequence}, missing logs: {len(missing_logs)}")
+            debug_print(f"[DEBUG] Checkpoint state: {checkpoint_state}")
+            
+            # Update checkpoint information
+            self.checkpoint_sequence = checkpoint_sequence
+            self.checkpoint_digest = checkpoint_digest
+            self.last_checkpoint = checkpoint_state.copy()
+            
+            # Start from checkpoint state
+            self.datastore = checkpoint_state.copy()
+            debug_print(f"[DEBUG] Node {self.node_id} updated datastore from checkpoint: {self.datastore}")
+            
+            # Apply missing log entries after checkpoint
+            debug_print(f"[DEBUG] Node {self.node_id} applying {len(missing_logs)} missing log entries")
+            for i, log_entry in enumerate(missing_logs):
+                if log_entry not in self.log:
+                    self.log.append(log_entry)
+                    debug_print(f"[DEBUG] Node {self.node_id} added log entry {i+1}: {log_entry}")
+                    # Apply the transaction if it's a commit
+                    if log_entry.get('type') == 'COMMIT':
+                        request = log_entry.get('request', {})
+                        if request and request.get('type') == 'REQUEST':
+                            transaction = request.get('transaction')
+                            if transaction:
+                                debug_print(f"[DEBUG] Node {self.node_id} applying transaction during catch-up: {transaction}")
+                                self.apply_transaction(transaction)
+                                debug_print(f"[DEBUG] Node {self.node_id} datastore after transaction: {self.datastore}")
+            
+            self.executed_sequence = current_executed_sequence
+            debug_print(f"[DEBUG] Node {self.node_id} catch-up complete: executed_sequence={self.executed_sequence}")
+            
+        else:
+            # Full state catch-up (fallback)
+            missing_logs = message['missing_logs']
+            current_datastore = message['current_datastore']
+            current_executed_sequence = message['current_executed_sequence']
+            current_checkpoint_sequence = message['current_checkpoint_sequence']
+            current_checkpoint_digest = message['current_checkpoint_digest']
+            
+            print(f"Node {self.node_id} applying full state catch-up")
+            
+            # Update our state with the received information
+            self.datastore = current_datastore.copy()
+            self.executed_sequence = current_executed_sequence
+            self.checkpoint_sequence = current_checkpoint_sequence
+            self.checkpoint_digest = current_checkpoint_digest
+            
+            # Add missing log entries
+            for log_entry in missing_logs:
+                if log_entry not in self.log:
+                    self.log.append(log_entry)
+        
+        print(f"Node {self.node_id} caught up: executed_sequence={self.executed_sequence}, datastore updated")
+        
+    def apply_transaction(self, transaction):
+        """Apply a transaction to the datastore"""
+        sender, receiver, amount = transaction
+        sender_key = f'client_{sender}'
+        receiver_key = f'client_{receiver}'
+        
+        if sender_key in self.datastore and receiver_key in self.datastore:
+            if self.datastore[sender_key] >= amount:
+                self.datastore[sender_key] -= amount
+                self.datastore[receiver_key] += amount
+                print(f"Node {self.node_id} applied transaction {transaction}: {sender_key}={self.datastore[sender_key]}, {receiver_key}={self.datastore[receiver_key]}")
+            else:
+                print(f"Node {self.node_id} insufficient funds for transaction {transaction}")
+            
     def timer_thread(self):
         while True:
             time.sleep(0.1)
@@ -680,7 +892,7 @@ class Client:
             'client_port': self.listener_port
         }
         
-        self.pending_requests[self.timestamp] = time.time()
+        self.pending_requests[self.timestamp] = {'start_time': time.time(), 'retries': 0}
         
         # Send to current leader using shared leader_id
         leader_port = 8000 + PaxosNode.leader_id
@@ -706,10 +918,19 @@ class Client:
             if timestamp in self.received_replies and self.received_replies[timestamp] == 'failed':
                 # Don't retry failed requests due to insufficient balance
                 del self.pending_requests[timestamp]
-                print(f"Client {self.client_id} not retrying failed request for timestamp {timestamp}")
+                debug_print(f"[DEBUG] Client {self.client_id} not retrying failed request for timestamp {timestamp}")
                 return
             
-            print(f"Client {self.client_id} retrying request for timestamp {timestamp}")
+            # Increment retry count
+            self.pending_requests[timestamp]['retries'] += 1
+            max_retries = 3  # Maximum number of retries
+            
+            if self.pending_requests[timestamp]['retries'] > max_retries:
+                debug_print(f"[DEBUG] Client {self.client_id} max retries ({max_retries}) exceeded for timestamp {timestamp}, giving up")
+                del self.pending_requests[timestamp]
+                return
+            
+            debug_print(f"[DEBUG] Client {self.client_id} retrying request for timestamp {timestamp} (attempt {self.pending_requests[timestamp]['retries']}/{max_retries})")
             self.broadcast_request(timestamp)
             
     def broadcast_request(self, timestamp):
@@ -759,15 +980,36 @@ def read_input_file(filename):
                 current_set = int(row[0])
                 if len(row) > 2 and row[2]:
                     live_nodes_str = row[2].replace('[', '').replace(']', '').replace(' ', '')
-                    live_nodes = [int(x) for x in live_nodes_str.split(',') if x]
+                    # Handle both old format (1,2,3) and new format (n1,n2,n3)
+                    if 'n' in live_nodes_str:
+                        # New format: n1, n2, n3, n4, n5
+                        live_nodes = [int(x.replace('n', '')) for x in live_nodes_str.split(',') if x]
+                    else:
+                        # Old format: 1, 2, 3, 4, 5
+                        live_nodes = [int(x) for x in live_nodes_str.split(',') if x]
                 else:
                     live_nodes = []
                 if current_set not in test_sets:
                     test_sets[current_set] = {'transactions': [], 'live_nodes': live_nodes}
             
             if len(row) > 1 and row[1]:
-                transaction = eval(row[1])
-                test_sets[current_set]['transactions'].append(transaction)
+                transaction_str = row[1].strip()
+                if transaction_str == 'LF':
+                    # Leader failure command
+                    test_sets[current_set]['transactions'].append('LF')
+                elif transaction_str:
+                    # Regular transaction - handle both formats
+                    if transaction_str.startswith('(') and transaction_str.endswith(')'):
+                        # Format: (A, J, 3) - convert to tuple
+                        transaction_str = transaction_str.replace('(', '').replace(')', '')
+                        parts = [part.strip() for part in transaction_str.split(',')]
+                        if len(parts) == 3:
+                            transaction = (parts[0], parts[1], int(parts[2]))
+                            test_sets[current_set]['transactions'].append(transaction)
+                    else:
+                        # Old format: ('A', 'C', 5)
+                        transaction = eval(transaction_str)
+                        test_sets[current_set]['transactions'].append(transaction)
     
     return test_sets
 
@@ -813,10 +1055,12 @@ def send_message_to_node(port, message):
         pass
 
 def main():
+    global DEBUG_MODE
     parser = argparse.ArgumentParser(description='Paxos Consensus Algorithm Implementation')
     parser.add_argument('-d', '--debug', action='store_true', 
                        help='Run in debug mode - automatically continue after 10 seconds instead of waiting for user input')
     args = parser.parse_args()
+    DEBUG_MODE = args.debug
     
     nodes = []
     ports = [8001, 8002, 8003, 8004, 8005]
@@ -833,10 +1077,12 @@ def main():
     nodes[0].is_leader = True
     nodes[0].ballot_number = (1, 1)
 
-    test_sets = read_input_file('tests/input.csv')
+    test_sets = read_input_file('tests/input4.csv')
 
     for set_number, test_data in test_sets.items():
-        print(f"Running Test Set {set_number}...")
+        debug_print(f"[DEBUG] Running Test Set {set_number}...")
+        debug_print(f"[DEBUG] Test Set {set_number} transactions: {test_data['transactions']}")
+        debug_print(f"[DEBUG] Test Set {set_number} live_nodes: {test_data['live_nodes']}")
         transactions = test_data['transactions']
         live_nodes = test_data['live_nodes']
         
@@ -854,28 +1100,69 @@ def main():
                 node.is_isolated = True
                 node.peers = []  # Remove all peers
                 node.is_leader = False  # Can't be leader if isolated
+                node.timer = None  # Stop timer
                 print(f"Node {node.node_id} isolated (disconnected)")
             else:
                 # This node is live - ensure it has proper peer connections
+                was_isolated = node.is_isolated
+                was_failed = node.is_failed
+                
                 node.is_isolated = False
+                # Recover from failure if it was failed
+                if node.is_failed:
+                    node.recover_from_failure()
                 # Restore peer connections to other live nodes
                 node.peers = [8000 + peer_id for peer_id in live_nodes if peer_id != node.node_id]
                 print(f"Node {node.node_id} connected to peers: {node.peers}")
+                
+                # If node was previously isolated or failed, trigger catch-up
+                if was_isolated or was_failed:
+                    time.sleep(2)  # Give more time for peer connections to establish
+                    debug_print(f"[DEBUG] Node {node.node_id} triggering catch-up (was_isolated={was_isolated}, was_failed={was_failed})")
+                    debug_print(f"[DEBUG] Node {node.node_id} current state before catch-up: executed_sequence={node.executed_sequence}, checkpoint_sequence={node.checkpoint_sequence}")
+                    debug_print(f"[DEBUG] Node {node.node_id} current datastore before catch-up: {node.datastore}")
+                    node.catch_up_with_peers(live_nodes)
+                    debug_print(f"[DEBUG] Node {node.node_id} catch-up call completed")
         
         clients = []
         for i in range(NUM_CLIENTS):
             client = Client(i, [8000 + node_id for node_id in live_nodes])
             clients.append(client)
         
-        # Send transactions with delays to avoid burst
-        for transaction in transactions:
-            sender, receiver, amount = transaction
-            client_id = ord(sender) - ord('A')
-            clients[client_id].send_request(transaction)
-            time.sleep(1.0)  # Increased delay to allow proper queuing
+        # Process transactions sequentially, including LF commands
+        debug_print(f"[DEBUG] Processing {len(transactions)} transactions in Test Set {set_number}")
+        for i, transaction in enumerate(transactions):
+            debug_print(f"[DEBUG] Processing transaction {i+1}/{len(transactions)}: {transaction}")
+            if transaction == 'LF':
+                # Leader failure command - send to current leader
+                current_leader = None
+                for node in nodes:
+                    if node.is_leader and not node.is_isolated and not node.is_failed:
+                        current_leader = node
+                        break
+                
+                if current_leader:
+                    debug_print(f"[DEBUG] Sending LF command to leader Node {current_leader.node_id}")
+                    leader_port = 8000 + current_leader.node_id
+                    message = {'type': 'LEADER_FAIL'}
+                    send_message_to_node(leader_port, message)
+                    time.sleep(2)  # Wait for leader to fail
+                else:
+                    print("No active leader found for LF command")
+            else:
+                # Regular transaction
+                sender, receiver, amount = transaction
+                client_id = ord(sender) - ord('A')
+                debug_print(f"[DEBUG] Sending transaction {transaction} from client {client_id} (sender: {sender})")
+                clients[client_id].send_request(transaction)
+                time.sleep(1.0)  # Delay to allow proper queuing
         
         # Wait for all transactions to be processed
         time.sleep(5)
+        
+        # Stop all timers to prevent timer expirations during result presentation
+        for node in nodes:
+            node.timer = None  # Stop the timer
         
         # Cleanup clients
         for client in clients:
