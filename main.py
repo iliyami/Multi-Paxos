@@ -15,6 +15,9 @@ INITIAL_BALANCE = 10
 MAJORITY = NUM_NODES // 2 + 1
 
 class PaxosNode:
+    # Shared class variable to track the current leader
+    leader_id = 1  # Start with node 1 as leader
+    
     def __init__(self, node_id, port, peers):
         self.node_id = node_id
         self.port = port
@@ -42,6 +45,12 @@ class PaxosNode:
         self.request_queue = Queue()
         self.committed_sequences = set()
         
+        # Transaction processing queue and lock
+        self.transaction_queue = Queue()
+        self.processing_lock = threading.Lock()
+        self.is_processing = False
+        self.is_isolated = False
+        
         self.lock = threading.Lock()
         self.socket = None
         
@@ -53,6 +62,7 @@ class PaxosNode:
         
         threading.Thread(target=self.accept_connections, daemon=True).start()
         threading.Thread(target=self.timer_thread, daemon=True).start()
+        threading.Thread(target=self.transaction_processor, daemon=True).start()
         
     def accept_connections(self):
         while True:
@@ -78,7 +88,23 @@ class PaxosNode:
     def handle_message(self, message):
         msg_type = message.get('type')
         
-        if msg_type == 'REQUEST':
+        # Allow print commands even for isolated nodes
+        if msg_type == 'PRINT_LOG':
+            self.print_log()
+        elif msg_type == 'PRINT_DB':
+            self.print_db()
+        elif msg_type == 'PRINT_STATUS':
+            self.print_status(message.get('sequence_number'))
+        elif msg_type == 'PRINT_VIEW':
+            self.print_view()
+        elif msg_type == 'PRINT_CHECKPOINT':
+            self.print_checkpoint()
+        elif msg_type == 'PROCESS_QUEUE':
+            self.process_transaction_queue()
+        # If this node is isolated, ignore all consensus messages
+        elif self.is_isolated:
+            return
+        elif msg_type == 'REQUEST':
             self.handle_request(message)
         elif msg_type == 'PREPARE':
             self.handle_prepare(message)
@@ -96,16 +122,6 @@ class PaxosNode:
             self.handle_checkpoint(message)
         elif msg_type == 'REPLY':
             pass
-        elif msg_type == 'PRINT_LOG':
-            self.print_log()
-        elif msg_type == 'PRINT_DB':
-            self.print_db()
-        elif msg_type == 'PRINT_STATUS':
-            self.print_status(message.get('sequence_number'))
-        elif msg_type == 'PRINT_VIEW':
-            self.print_view()
-        elif msg_type == 'PRINT_CHECKPOINT':
-            self.print_checkpoint()
             
     def handle_request(self, message):
         client_id = message['client_id']
@@ -120,6 +136,7 @@ class PaxosNode:
             self.send_reply(client_id, timestamp, self.client_replies[client_id][timestamp])
             return
             
+        # Add transaction to queue instead of processing immediately
         request_msg = {
             'type': 'REQUEST',
             'client_id': client_id,
@@ -127,37 +144,65 @@ class PaxosNode:
             'timestamp': timestamp
         }
         
-        self.pending_requests[self.sequence_number] = request_msg
-        self.log.append({'type': 'REQUEST', 'sequence': self.sequence_number, 'request': request_msg})
+        self.transaction_queue.put(request_msg)
+        print(f"Node {self.node_id} queued transaction: {transaction}")
         
+    def transaction_processor(self):
+        """Process transactions from the queue sequentially"""
+        while True:
+            try:
+                # Wait for a transaction in the queue
+                request_msg = self.transaction_queue.get(timeout=1.0)
+                
+                with self.processing_lock:
+                    if not self.is_leader:
+                        # If we're no longer the leader, forward to current leader
+                        self.forward_to_leader(request_msg)
+                        continue
+                    
+                    # Process the transaction
+                    self.process_single_transaction(request_msg)
+                    
+                self.transaction_queue.task_done()
+                
+            except:
+                # Timeout or other error, continue
+                continue
+                
+    def process_single_transaction(self, request_msg):
+        """Process a single transaction through Paxos consensus"""
+        client_id = request_msg['client_id']
+        transaction = request_msg['transaction']
+        timestamp = request_msg['timestamp']
+        
+        # Assign sequence number
+        current_seq = self.sequence_number
+        self.sequence_number += 1
+        
+        # Store in pending requests
+        self.pending_requests[current_seq] = request_msg
+        self.log.append({'type': 'REQUEST', 'sequence': current_seq, 'request': request_msg})
+        
+        # Send ACCEPT message
         accept_msg = {
             'type': 'ACCEPT',
             'ballot': self.ballot_number,
-            'sequence': self.sequence_number,
+            'sequence': current_seq,
             'request': request_msg,
             'checkpoint_sequence': self.checkpoint_sequence
         }
         
-        self.log.append({'type': 'ACCEPT_SENT', 'ballot': self.ballot_number, 'sequence': self.sequence_number})
+        self.log.append({'type': 'ACCEPT_SENT', 'ballot': self.ballot_number, 'sequence': current_seq})
         self.broadcast(accept_msg)
-        self.sequence_number += 1
         
     def forward_to_leader(self, message):
         leader_port = self.find_leader_port()
-        if leader_port:
-            self.send_message(leader_port, message)
+        self.send_message(leader_port, message)
             
     def find_leader_port(self):
-        for peer_port in self.peers:
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(0.1)
-                sock.connect(('localhost', peer_port))
-                sock.close()
-                return peer_port
-            except:
-                continue
-        return None
+        # Use the shared leader_id to get the leader's port
+        # No need to check connectivity since leader is always accessible
+        return 8000 + PaxosNode.leader_id
         
     def broadcast_accept(self):
         if not self.pending_requests:
@@ -211,6 +256,7 @@ class PaxosNode:
                 
     def become_leader(self):
         self.is_leader = True
+        PaxosNode.leader_id = self.node_id  # Update shared leader tracking
         self.reset_timer()
         
     def send_new_view(self):
@@ -256,6 +302,9 @@ class PaxosNode:
             self.promised_number = ballot
             self.accepted_log = [(ballot, seq, req) for ballot, seq, req in log]
             self.new_view_messages.append(message)
+            
+            # Update shared leader tracking
+            PaxosNode.leader_id = ballot[1]
             
             # Update checkpoint sequence if higher
             if checkpoint_seq > self.checkpoint_sequence:
@@ -596,7 +645,6 @@ class Client:
         self.listener_port = 5000 + client_id
         self.listener_socket = None
         self.listener_thread = None
-        self.current_leader = 1  # Start with node 1 as leader
         self.start_listener()
         
     def start_listener(self):
@@ -634,8 +682,8 @@ class Client:
         
         self.pending_requests[self.timestamp] = time.time()
         
-        # Send to current leader (or node 1 if unknown)
-        leader_port = 8000 + self.current_leader
+        # Send to current leader using shared leader_id
+        leader_port = 8000 + PaxosNode.leader_id
         self.send_to_node(leader_port, request_msg)
         
         threading.Thread(target=self.retry_timer, args=(self.timestamp,), daemon=True).start()
@@ -682,17 +730,9 @@ class Client:
     def handle_reply(self, message):
         timestamp = message['timestamp']
         result = message['result']
-        ballot = message.get('ballot', None)
         
         # Store the received reply
         self.received_replies[timestamp] = result
-        
-        # Update current leader if ballot number is provided
-        if ballot and isinstance(ballot, (list, tuple)) and len(ballot) >= 2:
-            new_leader = ballot[1]
-            if new_leader != self.current_leader:
-                print(f"Client {self.client_id} updated leader from {self.current_leader} to {new_leader}")
-                self.current_leader = new_leader
         
         # Remove from pending requests to stop retries
         if timestamp in self.pending_requests:
@@ -800,46 +840,52 @@ def main():
         transactions = test_data['transactions']
         live_nodes = test_data['live_nodes']
         
-        # Reset database state for each test set
+        # Clear pending requests but keep database state for interdependent test sets
         for node in nodes:
-            node.datastore = {f'client_{i}': 10 for i in range(10)}
-            node.log = []
-            node.executed_sequence = 0
-            node.accepted_log = []
             node.pending_requests = {}
-            node.committed_sequences = set()
+            node.client_replies = {}  # Clear cached client replies
+            # Keep datastore, log, executed_sequence, accepted_log, committed_sequences
+            # to maintain state across interdependent test sets
+        
+        # Isolate disconnected nodes by removing them from peer lists
+        for node in nodes:
+            if node.node_id not in live_nodes:
+                # This node is disconnected - isolate it from the network
+                node.is_isolated = True
+                node.peers = []  # Remove all peers
+                node.is_leader = False  # Can't be leader if isolated
+                print(f"Node {node.node_id} isolated (disconnected)")
+            else:
+                # This node is live - ensure it has proper peer connections
+                node.is_isolated = False
+                # Restore peer connections to other live nodes
+                node.peers = [8000 + peer_id for peer_id in live_nodes if peer_id != node.node_id]
+                print(f"Node {node.node_id} connected to peers: {node.peers}")
         
         clients = []
         for i in range(NUM_CLIENTS):
             client = Client(i, [8000 + node_id for node_id in live_nodes])
             clients.append(client)
         
+        # Send transactions with delays to avoid burst
         for transaction in transactions:
             sender, receiver, amount = transaction
             client_id = ord(sender) - ord('A')
             clients[client_id].send_request(transaction)
-            time.sleep(0.5)
+            time.sleep(1.0)  # Increased delay to allow proper queuing
         
-        time.sleep(2)
+        # Wait for all transactions to be processed
+        time.sleep(5)
         
         # Cleanup clients
         for client in clients:
             client.cleanup()
 
         while True:
-            if args.debug and set_number == 1:
+            if args.debug:
                 print(f"\nTest Set {set_number} executed. Debug mode: automatically continuing in 10 seconds...")
-                print("\nDatabase after Test Set 1:")
+                print(f"\nDatabase after Test Set {set_number}:")
                 print_db()
-                
-                # Write database to file for verification
-                with open('database_results.txt', 'w') as f:
-                    f.write("Database after Test Set 1:\n")
-                    for node_id in range(1, NUM_NODES + 1):
-                        node_port = 8000 + node_id
-                        message = {'type': 'PRINT_DB', 'node_id': node_id}
-                        # We'll capture this in the print_db function
-                
                 time.sleep(10)
                 break
             else:
