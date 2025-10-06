@@ -132,9 +132,11 @@ class PaxosNode:
             'type': 'ACCEPT',
             'ballot': self.ballot_number,
             'sequence': self.sequence_number,
-            'request': request_msg
+            'request': request_msg,
+            'checkpoint_sequence': self.checkpoint_sequence
         }
         
+        self.log.append({'type': 'ACCEPT_SENT', 'ballot': self.ballot_number, 'sequence': self.sequence_number})
         self.broadcast(accept_msg)
         self.sequence_number += 1
         
@@ -164,12 +166,15 @@ class PaxosNode:
                 'type': 'ACCEPT',
                 'ballot': self.ballot_number,
                 'sequence': seq_num,
-                'request': request
+                'request': request,
+                'checkpoint_sequence': self.checkpoint_sequence
             }
             self.broadcast(accept_msg)
 
     def handle_prepare(self, message):
         ballot = message['ballot']
+        
+        self.log.append({'type': 'PREPARE', 'ballot': ballot, 'from_node': ballot[1]})
         
         if ballot > self.promised_number:
             self.promised_number = ballot
@@ -182,6 +187,8 @@ class PaxosNode:
                 'checkpoint_sequence': self.checkpoint_sequence
             }
             
+            self.log.append({'type': 'PROMISE', 'ballot': ballot, 'to_node': ballot[1]})
+            
             sender_port = self.find_port_by_ballot(ballot[1])
             if sender_port:
                 self.send_message(sender_port, promise_msg)
@@ -190,6 +197,8 @@ class PaxosNode:
         ballot = message['ballot']
         accepted_log = message['accepted_log']
         checkpoint_seq = message.get('checkpoint_sequence', 0)
+        
+        self.log.append({'type': 'PROMISE_RECEIVED', 'ballot': ballot, 'from_node': ballot[1]})
         
         if ballot == self.ballot_number:
             self.accepted_log.extend(accepted_log)
@@ -222,9 +231,11 @@ class PaxosNode:
         new_view_msg = {
             'type': 'NEW_VIEW',
             'ballot': self.ballot_number,
-            'log': new_view_log
+            'log': new_view_log,
+            'checkpoint_sequence': self.checkpoint_sequence
         }
         
+        self.log.append({'type': 'NEW_VIEW_SENT', 'ballot': self.ballot_number, 'log_entries': len(new_view_log)})
         self.new_view_messages.append(new_view_msg)
         self.broadcast(new_view_msg)
         
@@ -235,11 +246,18 @@ class PaxosNode:
     def handle_new_view(self, message):
         ballot = message['ballot']
         log = message['log']
+        checkpoint_seq = message.get('checkpoint_sequence', 0)
+        
+        self.log.append({'type': 'NEW_VIEW_RECEIVED', 'ballot': ballot, 'from_node': ballot[1]})
         
         if ballot >= self.promised_number:
             self.promised_number = ballot
             self.accepted_log = [(ballot, seq, req) for ballot, seq, req in log]
             self.new_view_messages.append(message)
+            
+            # Update checkpoint sequence if higher
+            if checkpoint_seq > self.checkpoint_sequence:
+                self.checkpoint_sequence = checkpoint_seq
             
             for ballot, seq, request in log:
                 if request.get('type') != 'NO_OP':
@@ -249,6 +267,12 @@ class PaxosNode:
         ballot = message['ballot']
         sequence = message['sequence']
         request = message['request']
+        
+        # Convert list to tuple for ballot comparison
+        if isinstance(ballot, list):
+            ballot = tuple(ballot)
+        
+        self.log.append({'type': 'ACCEPT_RECEIVED', 'ballot': ballot, 'sequence': sequence, 'from_node': ballot[1]})
         
         if ballot >= self.promised_number:
             self.promised_number = ballot
@@ -263,6 +287,8 @@ class PaxosNode:
                 'node_id': self.node_id
             }
             
+            self.log.append({'type': 'ACCEPTED_SENT', 'ballot': ballot, 'sequence': sequence, 'to_node': ballot[1]})
+            
             sender_port = self.find_port_by_ballot(ballot[1])
             if sender_port:
                 self.send_message(sender_port, accepted_msg)
@@ -273,12 +299,21 @@ class PaxosNode:
         request = message['request']
         node_id = message['node_id']
         
+        # Convert list to tuple for ballot comparison
+        if isinstance(ballot, list):
+            ballot = tuple(ballot)
+        
+        self.log.append({'type': 'ACCEPTED_RECEIVED', 'ballot': ballot, 'sequence': sequence, 'from_node': node_id})
+        
         if ballot == self.ballot_number and self.is_leader:
             if sequence not in self.pending_requests:
                 return
                 
-            accepted_count = sum(1 for entry in self.accepted_log 
-                               if entry[0] == ballot and entry[1] == sequence)
+            # Count ACCEPTED messages for this sequence
+            accepted_count = sum(1 for entry in self.log 
+                               if (entry.get('type') == 'ACCEPTED_RECEIVED' and 
+                                   entry.get('ballot') == ballot and 
+                                   entry.get('sequence') == sequence))
             
             if accepted_count >= MAJORITY - 1:
                 self.commit_transaction(sequence, request)
@@ -315,8 +350,13 @@ class PaxosNode:
             'request': request
         }
         
+        self.log.append({'type': 'COMMIT_SENT', 'ballot': self.ballot_number, 'sequence': sequence})
         self.broadcast(commit_msg)
         self.send_reply(client_id, timestamp, result)
+        
+        # Create checkpoint every 3 transactions (bonus feature)
+        if self.executed_sequence % 3 == 0 and self.executed_sequence > 0:
+            self.create_checkpoint()
         
         if sequence in self.pending_requests:
             del self.pending_requests[sequence]
@@ -325,6 +365,12 @@ class PaxosNode:
         ballot = message['ballot']
         sequence = message['sequence']
         request = message['request']
+        
+        # Convert list to tuple for ballot comparison
+        if isinstance(ballot, list):
+            ballot = tuple(ballot)
+        
+        self.log.append({'type': 'COMMIT_RECEIVED', 'ballot': ballot, 'sequence': sequence, 'from_node': ballot[1]})
         
         if request.get('type') == 'NO_OP':
             self.executed_sequence = max(self.executed_sequence, sequence)
@@ -366,8 +412,16 @@ class PaxosNode:
             'result': result
         }
         
-        client_port = 9000 + client_id
-        self.send_message(client_port, reply_msg)
+        # Send reply to client using 5000 range ports
+        client_port = 5000 + client_id
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1.0)
+            sock.connect(('localhost', client_port))
+            sock.send(json.dumps(reply_msg).encode())
+            sock.close()
+        except Exception as e:
+            pass
         
     def handle_checkpoint(self, message):
         sequence = message['sequence']
@@ -409,6 +463,8 @@ class PaxosNode:
         self.prepare_timer = time.time()
         self.ballot_number = (self.ballot_number[0] + 1, self.node_id)
         self.accepted_log = []
+        
+        self.log.append({'type': 'LEADER_ELECTION_STARTED', 'ballot': self.ballot_number})
         
         prepare_msg = {
             'type': 'PREPARE',
@@ -508,20 +564,51 @@ class Client:
         self.timestamp = 0
         self.pending_requests = {}
         self.timer_duration = 3.0
+        self.received_replies = {}
+        self.listener_port = 5000 + client_id
+        self.listener_socket = None
+        self.listener_thread = None
+        self.current_leader = 1  # Start with node 1 as leader
+        self.start_listener()
         
+    def start_listener(self):
+        try:
+            self.listener_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.listener_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.listener_socket.bind(('localhost', self.listener_port))
+            self.listener_socket.listen(5)
+            self.listener_thread = threading.Thread(target=self.listen_for_replies, daemon=True)
+            self.listener_thread.start()
+        except Exception as e:
+            print(f"Client {self.client_id} failed to start listener: {e}")
+            
+    def listen_for_replies(self):
+        while True:
+            try:
+                conn, addr = self.listener_socket.accept()
+                data = conn.recv(1024)
+                if data:
+                    message = json.loads(data.decode())
+                    self.handle_reply(message)
+                conn.close()
+            except Exception as e:
+                break
+                
     def send_request(self, transaction):
         self.timestamp += 1
         request_msg = {
             'type': 'REQUEST',
             'client_id': self.client_id,
             'transaction': transaction,
-            'timestamp': self.timestamp
+            'timestamp': self.timestamp,
+            'client_port': self.listener_port
         }
         
         self.pending_requests[self.timestamp] = time.time()
         
-        first_node_port = 8001
-        self.send_to_node(first_node_port, request_msg)
+        # Send to current leader (or node 1 if unknown)
+        leader_port = 8000 + self.current_leader
+        self.send_to_node(leader_port, request_msg)
         
         threading.Thread(target=self.retry_timer, args=(self.timestamp,), daemon=True).start()
         
@@ -537,8 +624,16 @@ class Client:
             
     def retry_timer(self, timestamp):
         time.sleep(self.timer_duration)
-        if timestamp in self.pending_requests:
-            del self.pending_requests[timestamp]
+        # Check if we received a reply for this timestamp
+        if timestamp in self.pending_requests and timestamp not in self.received_replies:
+            # Check if the request failed due to insufficient balance
+            if timestamp in self.received_replies and self.received_replies[timestamp] == 'failed':
+                # Don't retry failed requests due to insufficient balance
+                del self.pending_requests[timestamp]
+                print(f"Client {self.client_id} not retrying failed request for timestamp {timestamp}")
+                return
+            
+            print(f"Client {self.client_id} retrying request for timestamp {timestamp}")
             self.broadcast_request(timestamp)
             
     def broadcast_request(self, timestamp):
@@ -546,7 +641,8 @@ class Client:
             'type': 'REQUEST',
             'client_id': self.client_id,
             'transaction': self.get_transaction_by_timestamp(timestamp),
-            'timestamp': timestamp
+            'timestamp': timestamp,
+            'client_port': self.listener_port
         }
         
         for node_port in self.nodes:
@@ -554,6 +650,34 @@ class Client:
             
     def get_transaction_by_timestamp(self, timestamp):
         return None
+        
+    def handle_reply(self, message):
+        timestamp = message['timestamp']
+        result = message['result']
+        ballot = message.get('ballot', None)
+        
+        # Store the received reply
+        self.received_replies[timestamp] = result
+        
+        # Update current leader if ballot number is provided
+        if ballot and isinstance(ballot, (list, tuple)) and len(ballot) >= 2:
+            new_leader = ballot[1]
+            if new_leader != self.current_leader:
+                print(f"Client {self.client_id} updated leader from {self.current_leader} to {new_leader}")
+                self.current_leader = new_leader
+        
+        # Remove from pending requests to stop retries
+        if timestamp in self.pending_requests:
+            del self.pending_requests[timestamp]
+            print(f"Client {self.client_id} received reply for timestamp {timestamp}: {result}")
+            print(f"Client {self.client_id} stopped timer for timestamp {timestamp}")
+            
+    def cleanup(self):
+        if self.listener_socket:
+            try:
+                self.listener_socket.close()
+            except:
+                pass
 
 def read_input_file(filename):
     test_sets = {}
@@ -632,12 +756,12 @@ def main():
         time.sleep(0.1)
 
     time.sleep(2)
-    
+
     nodes[0].is_leader = True
     nodes[0].ballot_number = (1, 1)
-    
+
     test_sets = read_input_file('tests/input.csv')
-    
+
     for set_number, test_data in test_sets.items():
         print(f"Running Test Set {set_number}...")
         transactions = test_data['transactions']
@@ -662,35 +786,12 @@ def main():
             clients[client_id].send_request(transaction)
             time.sleep(0.5)
         
-        time.sleep(5)
+        time.sleep(8)
         
-        # Process transactions through proper Paxos consensus
-        for i, transaction in enumerate(transactions):
-            sender, receiver, amount = transaction
-            sender_key = f'client_{ord(sender) - ord("A")}'
-            receiver_key = f'client_{ord(receiver) - ord("A")}'
-            
-            # Check if sender has sufficient balance
-            current_balance = nodes[0].datastore.get(sender_key, 0)
-            if current_balance >= amount:
-                # Update all nodes consistently
-                for node in nodes:
-                    node.datastore[sender_key] = current_balance - amount
-                    node.datastore[receiver_key] = node.datastore.get(receiver_key, 0) + amount
-                    # Add COMMIT to log with proper sequence number
-                    commit_entry = {
-                        'type': 'COMMIT', 
-                        'ballot': (1, 1), 
-                        'sequence': i + 1, 
-                        'request': {'transaction': transaction}
-                    }
-                    node.log.append(commit_entry)
-                    node.executed_sequence = max(node.executed_sequence, i + 1)
-                    
-                    # Create checkpoint every 3 transactions (bonus feature)
-                    if node.executed_sequence % 3 == 0 and node.executed_sequence > 0:
-                        node.create_checkpoint()
-    
+        # Cleanup clients
+        for client in clients:
+            client.cleanup()
+
         while True:
             user_input = input(
                 f"\nTest Set {set_number} executed. Press Enter to continue to the next set, "
