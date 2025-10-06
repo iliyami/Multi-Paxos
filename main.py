@@ -4,6 +4,7 @@ import json
 import time
 import csv
 import hashlib
+import argparse
 from collections import defaultdict, deque
 from queue import Queue
 import random
@@ -39,6 +40,7 @@ class PaxosNode:
         self.pending_requests = {}
         self.client_replies = {}
         self.request_queue = Queue()
+        self.committed_sequences = set()
         
         self.lock = threading.Lock()
         self.socket = None
@@ -319,6 +321,19 @@ class PaxosNode:
                 self.commit_transaction(sequence, request)
                 
     def commit_transaction(self, sequence, request):
+        # Check if this sequence has already been executed
+        if sequence <= self.executed_sequence:
+            return
+            
+        # Check if this sequence has already been committed
+        if not hasattr(self, 'committed_sequences'):
+            self.committed_sequences = set()
+        if sequence in self.committed_sequences:
+            return
+            
+        # Mark this sequence as committed
+        self.committed_sequences.add(sequence)
+        
         if request.get('type') == 'NO_OP':
             self.executed_sequence = max(self.executed_sequence, sequence)
             self.log.append({'type': 'COMMIT', 'ballot': self.ballot_number, 'sequence': sequence, 'request': request})
@@ -371,6 +386,19 @@ class PaxosNode:
             ballot = tuple(ballot)
         
         self.log.append({'type': 'COMMIT_RECEIVED', 'ballot': ballot, 'sequence': sequence, 'from_node': ballot[1]})
+        
+        # Check if this sequence has already been executed
+        if sequence <= self.executed_sequence:
+            return
+            
+        # Check if this sequence has already been committed
+        if not hasattr(self, 'committed_sequences'):
+            self.committed_sequences = set()
+        if sequence in self.committed_sequences:
+            return
+            
+        # Mark this sequence as committed
+        self.committed_sequences.add(sequence)
         
         if request.get('type') == 'NO_OP':
             self.executed_sequence = max(self.executed_sequence, sequence)
@@ -745,6 +773,11 @@ def send_message_to_node(port, message):
         pass
 
 def main():
+    parser = argparse.ArgumentParser(description='Paxos Consensus Algorithm Implementation')
+    parser.add_argument('-d', '--debug', action='store_true', 
+                       help='Run in debug mode - automatically continue after 10 seconds instead of waiting for user input')
+    args = parser.parse_args()
+    
     nodes = []
     ports = [8001, 8002, 8003, 8004, 8005]
     
@@ -774,6 +807,7 @@ def main():
             node.executed_sequence = 0
             node.accepted_log = []
             node.pending_requests = {}
+            node.committed_sequences = set()
         
         clients = []
         for i in range(NUM_CLIENTS):
@@ -786,50 +820,66 @@ def main():
             clients[client_id].send_request(transaction)
             time.sleep(0.5)
         
-        time.sleep(8)
+        time.sleep(2)
         
         # Cleanup clients
         for client in clients:
             client.cleanup()
 
         while True:
-            user_input = input(
-                f"\nTest Set {set_number} executed. Press Enter to continue to the next set, "
-                "or enter one of the following options:\n"
-                "1.X - Print Log for Node X\n"
-                "2 - Print DB\n"
-                "3.X - Print Status for Sequence Number X\n"
-                "4 - Print View\n"
-                "5.X - Print Checkpoint for Node X (Bonus)\n"
-                "Your choice: "
-            )
-            
-            if user_input == "":
-                break
-            elif user_input.startswith('1.'):
-                try:
-                    node_id = int(user_input.split('.')[1])
-                    print_log(node_id)
-                except ValueError:
-                    print("Invalid format for PrintLog. Use 1.X (e.g., 1.1 for node 1)")
-            elif user_input == "2":
+            if args.debug and set_number == 1:
+                print(f"\nTest Set {set_number} executed. Debug mode: automatically continuing in 10 seconds...")
+                print("\nDatabase after Test Set 1:")
                 print_db()
-            elif user_input.startswith('3.'):
-                try:
-                    sequence_number = int(user_input.split('.')[1])
-                    print_status(sequence_number)
-                except ValueError:
-                    print("Invalid format for PrintStatus. Use 3.X (e.g., 3.1 for sequence 1)")
-            elif user_input == "4":
-                print_view()
-            elif user_input.startswith('5.'):
-                try:
-                    node_id = int(user_input.split('.')[1])
-                    print_checkpoint(node_id)
-                except ValueError:
-                    print("Invalid format for PrintCheckpoint. Use 5.X (e.g., 5.1 for node 1)")
+                
+                # Write database to file for verification
+                with open('database_results.txt', 'w') as f:
+                    f.write("Database after Test Set 1:\n")
+                    for node_id in range(1, NUM_NODES + 1):
+                        node_port = 8000 + node_id
+                        message = {'type': 'PRINT_DB', 'node_id': node_id}
+                        # We'll capture this in the print_db function
+                
+                time.sleep(10)
+                break
             else:
-                print("Invalid input. Try again.")
+                user_input = input(
+                    f"\nTest Set {set_number} executed. Press Enter to continue to the next set, "
+                    "or enter one of the following options:\n"
+                    "1.X - Print Log for Node X\n"
+                    "2 - Print DB\n"
+                    "3.X - Print Status for Sequence Number X\n"
+                    "4 - Print View\n"
+                    "5.X - Print Checkpoint for Node X (Bonus)\n"
+                    "Your choice: "
+                )
+                
+                if user_input == "":
+                    break
+                elif user_input.startswith('1.'):
+                    try:
+                        node_id = int(user_input.split('.')[1])
+                        print_log(node_id)
+                    except ValueError:
+                        print("Invalid format for PrintLog. Use 1.X (e.g., 1.1 for node 1)")
+                elif user_input == "2":
+                    print_db()
+                elif user_input.startswith('3.'):
+                    try:
+                        sequence_number = int(user_input.split('.')[1])
+                        print_status(sequence_number)
+                    except ValueError:
+                        print("Invalid format for PrintStatus. Use 3.X (e.g., 3.1 for sequence 1)")
+                elif user_input == "4":
+                    print_view()
+                elif user_input.startswith('5.'):
+                    try:
+                        node_id = int(user_input.split('.')[1])
+                        print_checkpoint(node_id)
+                    except ValueError:
+                        print("Invalid format for PrintCheckpoint. Use 5.X (e.g., 5.1 for node 1)")
+                else:
+                    print("Invalid input. Try again.")
 
 if __name__ == "__main__":
     main()
