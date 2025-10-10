@@ -656,8 +656,10 @@ class PaxosNode:
         # Reset timer when leader commits transactions (actively processing)
         self.reset_timer()
         
-        # Create checkpoint every 3 transactions (bonus feature)
-        if self.executed_sequence % 3 == 0 and self.executed_sequence > 0:
+        # Create checkpoint every 3 transactions (bonus feature) - ONLY LEADER
+        if self.is_leader and self.executed_sequence % 3 == 0 and self.executed_sequence > 0:
+            debug_print(f"[DEBUG] CHECKPOINT_CREATE: Node {self.node_id} creating checkpoint at sequence {self.executed_sequence}")
+            debug_print(f"[DEBUG] CHECKPOINT_CREATE: Node {self.node_id} datastore: {self.datastore}")
             self.create_checkpoint()
         
         if sequence in self.pending_requests:
@@ -766,10 +768,29 @@ class PaxosNode:
         sequence = message['sequence']
         digest = message['digest']
         
-        if sequence > self.checkpoint_sequence:
+        debug_print(f"[DEBUG] CHECKPOINT_HANDLE: Node {self.node_id} received CHECKPOINT with sequence {sequence}, current checkpoint_sequence: {self.checkpoint_sequence}")
+        debug_print(f"[DEBUG] CHECKPOINT_HANDLE: Node {self.node_id} current datastore: {self.datastore}")
+        debug_print(f"[DEBUG] CHECKPOINT_HANDLE: Node {self.node_id} executed_sequence: {self.executed_sequence}")
+        
+        # Case 1: PIAZZA Discussion if follower->lastExecutedSeqNum is the same as or greater than CheckpointMsgSeqNum 
+        # => update the follower->lastCheckpointedSeqNum to CheckpointMsgSeqNum
+        if self.executed_sequence >= sequence:
+            if sequence > self.checkpoint_sequence:
+                self.checkpoint_sequence = sequence
+                self.checkpoint_digest = digest
+                self.last_checkpoint = self.datastore.copy()
+                debug_print(f"[DEBUG] Node {self.node_id} updated checkpoint_sequence to {sequence} (case 1)")
+        
+        # Case 2: if follower->lastExecutedSeqNum is less than CheckpointMsgSeqNum 
+        # => obtain the state; update the state; update the follower->lastCheckpointedSeqNum to CheckpointMsgSeqNum
+        elif self.executed_sequence < sequence:
+            # For this project, we should NOT overwrite the entire state from checkpoint
+            # Instead, just update checkpoint information and let normal catch-up handle state sync
             self.checkpoint_sequence = sequence
             self.checkpoint_digest = digest
-            self.last_checkpoint = self.datastore.copy()
+            if 'state' in message:
+                self.last_checkpoint = message['state'].copy()
+            debug_print(f"[DEBUG] Node {self.node_id} updated checkpoint_sequence to {sequence} (case 2, preserving local state)")
             
     def create_checkpoint(self):
         if self.executed_sequence % 3 == 0 and self.executed_sequence > 0:
@@ -779,9 +800,11 @@ class PaxosNode:
             checkpoint_msg = {
                 'type': 'CHECKPOINT',
                 'sequence': self.executed_sequence,
-                'digest': digest
+                'digest': digest,
+                'state': self.datastore.copy()  # Include actual state as suggested in description
             }
             
+            debug_print(f"[DEBUG] Node {self.node_id} creating CHECKPOINT at sequence {self.executed_sequence}")
             self.broadcast(checkpoint_msg)
             
     def handle_leader_failure(self):
@@ -851,7 +874,10 @@ class PaxosNode:
         debug_print(f"[DEBUG] Node {self.node_id} has checkpoint: {self.last_checkpoint is not None}")
         
         # Determine the best catch-up strategy based on checkpoint availability
-        if self.checkpoint_sequence > requester_checkpoint_sequence and self.last_checkpoint:
+        # Only use checkpoint-based catch-up if the requester is not too far behind
+        if (self.checkpoint_sequence > requester_checkpoint_sequence and 
+            self.last_checkpoint and 
+            requester_sequence >= self.checkpoint_sequence - 3):  # Allow small gap
             # Use checkpoint-based catch-up (more efficient)
             debug_print(f"[DEBUG] Node {self.node_id} using checkpoint-based catch-up")
             
@@ -956,12 +982,16 @@ class PaxosNode:
             current_checkpoint_digest = message['current_checkpoint_digest']
             
             print(f"Node {self.node_id} applying full state catch-up")
+            debug_print(f"[DEBUG] NODE4_CATCHUP: Node {self.node_id} BEFORE catch-up - datastore: {self.datastore}")
+            debug_print(f"[DEBUG] NODE4_CATCHUP: Received datastore: {current_datastore}")
             
             # Update our state with the received information
             self.datastore = current_datastore.copy()
             self.executed_sequence = current_executed_sequence
             self.checkpoint_sequence = current_checkpoint_sequence
             self.checkpoint_digest = current_checkpoint_digest
+            
+            debug_print(f"[DEBUG] NODE4_CATCHUP: Node {self.node_id} AFTER catch-up - datastore: {self.datastore}")
             
             # Add missing log entries
             for log_entry in missing_logs:
@@ -1412,13 +1442,17 @@ def main():
                     if node.node_id != leader_node.node_id:
                         # Only synchronize if the node is not isolated in the current test set
                         if node.node_id in live_nodes:
+                            debug_print(f"[DEBUG] NODE4_SYNC: Node {node.node_id} BEFORE sync - datastore: {node.datastore}")
+                            debug_print(f"[DEBUG] NODE4_SYNC: Leader {leader_node.node_id} datastore: {leader_node.datastore}")
                             node.datastore = leader_node.datastore.copy()
                             node.executed_sequence = leader_node.executed_sequence
                             node.checkpoint_sequence = leader_node.checkpoint_sequence
                             node.checkpoint_digest = leader_node.checkpoint_digest
                             node.last_checkpoint = leader_node.last_checkpoint.copy() if leader_node.last_checkpoint else None
+                            debug_print(f"[DEBUG] NODE4_SYNC: Node {node.node_id} AFTER sync - datastore: {node.datastore}")
                             debug_print(f"[DEBUG] Node {node.node_id} synchronized with leader: executed_sequence={node.executed_sequence}")
                         else:
+                            debug_print(f"[DEBUG] NODE4_SYNC: Node {node.node_id} NOT synchronized (isolated) - preserving datastore: {node.datastore}")
                             debug_print(f"[DEBUG] Node {node.node_id} not synchronized (isolated in current test set)")
         
         # Keep the same leader across test sets unless there was a leader failure
