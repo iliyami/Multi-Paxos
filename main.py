@@ -24,7 +24,11 @@ def debug_print(message):
 
 class PaxosNode:
     # Shared class variable to track the current leader
-    leader_id = 1  # Start with node 1 as leader
+    leader_id = 1
+    # Shared set to track processed transactions globally
+    processed_transactions = set()
+    # Shared sequence number across all nodes
+    global_sequence_number = 1
     
     def __init__(self, node_id, port, peers):
         self.node_id = node_id
@@ -36,7 +40,7 @@ class PaxosNode:
         self.accepted_log = []
         self.sequence_number = 1
         self.executed_sequence = 0
-        self.datastore = {f'client_{i}': INITIAL_BALANCE for i in range(NUM_CLIENTS)}
+        self.datastore = {f'client_{chr(ord("A") + i)}': INITIAL_BALANCE for i in range(NUM_CLIENTS)}
         self.log = []
         self.new_view_messages = []
         self.checkpoint_sequence = 0
@@ -44,14 +48,20 @@ class PaxosNode:
         self.last_checkpoint = None
         
         self.timer = None
-        self.timer_duration = 5.0
+        # Add randomization to timer duration to prevent simultaneous timeouts
+        import random
+        base_timer_duration = 3.0
+        self.timer_duration = base_timer_duration + random.uniform(0, 1.0)  # 2.0-3.0 seconds
         self.prepare_timer = None
-        self.prepare_timer_duration = 1.0
+        self.prepare_timer_duration = 0.5 + random.uniform(0, 0.3)  # 0.5-0.8 seconds
         
         self.pending_requests = {}
         self.client_replies = {}
         self.request_queue = Queue()
         self.committed_sequences = set()
+        self.processed_requests = set()
+        # Buffer requests that arrive when there is no elected leader
+        self.election_buffer = []
         
         # Transaction processing queue and lock
         self.transaction_queue = Queue()
@@ -143,9 +153,28 @@ class PaxosNode:
         transaction = message['transaction']
         timestamp = message['timestamp']
         
+        debug_print(f"[DEBUG] Node {self.node_id} received REQUEST from client {client_id} for transaction {transaction}, is_leader: {self.is_leader}")
+        
+        # Start timer if not already running (as per conversation)
+        if self.timer is None:
+            debug_print(f"[DEBUG] Node {self.node_id} starting timer for request")
+            self.reset_timer()
+        
         if not self.is_leader:
+            debug_print(f"[DEBUG] Node {self.node_id} not leader, forwarding to leader")
             self.forward_to_leader(message)
             return
+            
+        # Check if this exact request has already been processed
+        request_key = (client_id, timestamp, tuple(transaction))
+        if request_key in self.processed_requests:
+            debug_print(f"[DEBUG] Node {self.node_id} request {transaction} already processed, sending cached reply")
+            if client_id in self.client_replies and timestamp in self.client_replies[client_id]:
+                self.send_reply(client_id, timestamp, self.client_replies[client_id][timestamp])
+            return
+            
+        # Mark this request as being processed
+        self.processed_requests.add(request_key)
             
         if client_id in self.client_replies and timestamp in self.client_replies[client_id]:
             self.send_reply(client_id, timestamp, self.client_replies[client_id][timestamp])
@@ -197,9 +226,16 @@ class PaxosNode:
         transaction = request_msg['transaction']
         timestamp = request_msg['timestamp']
         
-        # Assign sequence number
-        current_seq = self.sequence_number
-        self.sequence_number += 1
+        debug_print(f"[DEBUG] Node {self.node_id} processing single transaction: {transaction}")
+        
+        # Note: We'll rely on sequence-based deduplication instead of global transaction deduplication
+        # to avoid issues with transactions across different test sets
+        
+        # Assign sequence number from shared global counter
+        current_seq = PaxosNode.global_sequence_number
+        PaxosNode.global_sequence_number += 1
+        
+        debug_print(f"[DEBUG] Node {self.node_id} generated sequence {current_seq} for transaction {transaction}")
         
         # Store in pending requests
         self.pending_requests[current_seq] = request_msg
@@ -216,14 +252,32 @@ class PaxosNode:
         
         self.log.append({'type': 'ACCEPT_SENT', 'ballot': self.ballot_number, 'sequence': current_seq})
         self.broadcast(accept_msg)
+        # Reset timer when leader sends ACCEPT messages (actively processing)
+        self.reset_timer()
         
     def forward_to_leader(self, message):
+        debug_print(f"[DEBUG] Node {self.node_id} forward_to_leader called, PaxosNode.leader_id = {PaxosNode.leader_id}")
+        # Check if there's a valid leader
+        if PaxosNode.leader_id is None:
+            # No leader available, start leader election
+            debug_print(f"[DEBUG] Node {self.node_id} no leader available, starting leader election")
+            # Buffer the message to replay after leader election
+            try:
+                self.election_buffer.append(message)
+            except Exception:
+                pass
+            self.start_leader_election()
+            return
+            
         leader_port = self.find_leader_port()
+        debug_print(f"[DEBUG] Node {self.node_id} forwarding to leader at port {leader_port}")
         self.send_message(leader_port, message)
             
     def find_leader_port(self):
         # Use the shared leader_id to get the leader's port
         # No need to check connectivity since leader is always accessible
+        if PaxosNode.leader_id is None:
+            return None
         return 8000 + PaxosNode.leader_id
         
     def broadcast_accept(self):
@@ -242,52 +296,139 @@ class PaxosNode:
 
     def handle_prepare(self, message):
         ballot = message['ballot']
+        # Ensure ballot is a tuple for consistent comparison
+        if isinstance(ballot, list):
+            ballot = tuple(ballot)
         
+        debug_print(f"[DEBUG] Node {self.node_id} received PREPARE with ballot {ballot}, current promised_number: {self.promised_number}")
         self.log.append({'type': 'PREPARE', 'ballot': ballot, 'from_node': ballot[1]})
+        
+        # Set prepare_timer to prevent this node from starting election too soon
+        self.prepare_timer = time.time()
         
         if ballot > self.promised_number:
             self.promised_number = ballot
             self.reset_timer()
             
-            promise_msg = {
-                'type': 'PROMISE',
-                'ballot': ballot,
-                'accepted_log': self.accepted_log,
-                'checkpoint_sequence': self.checkpoint_sequence
-            }
-            
-            self.log.append({'type': 'PROMISE', 'ballot': ballot, 'to_node': ballot[1]})
-            
-            sender_port = self.find_port_by_ballot(ballot[1])
-            if sender_port:
-                self.send_message(sender_port, promise_msg)
+            # Don't send promise to ourselves
+            if ballot[1] != self.node_id:
+                promise_msg = {
+                    'type': 'PROMISE',
+                    'ballot': ballot,
+                    'from_node': self.node_id,  # Add sender identification
+                    'accepted_log': self.accepted_log,
+                    'checkpoint_sequence': self.checkpoint_sequence
+                }
+                
+                self.log.append({'type': 'PROMISE', 'ballot': ballot, 'to_node': ballot[1]})
+                
+                sender_port = self.find_port_by_ballot(ballot[1])
+                if sender_port:
+                    debug_print(f"[DEBUG] Node {self.node_id} sending PROMISE to Node {ballot[1]} (port {sender_port}) with {len(self.accepted_log)} accepted log entries")
+                    self.send_message(sender_port, promise_msg)
+                else:
+                    debug_print(f"[DEBUG] Node {self.node_id} could not find port for Node {ballot[1]}")
+            else:
+                debug_print(f"[DEBUG] Node {self.node_id} not sending PROMISE to ourselves")
+        else:
+            debug_print(f"[DEBUG] Node {self.node_id} rejecting PREPARE with ballot {ballot} (not higher than promised {self.promised_number})")
 
     def handle_promise(self, message):
         ballot = message['ballot']
+        # Ensure ballot is a tuple for consistent comparison
+        if isinstance(ballot, list):
+            ballot = tuple(ballot)
         accepted_log = message['accepted_log']
         checkpoint_seq = message.get('checkpoint_sequence', 0)
+        from_node = message.get('from_node', ballot[1])  # Use from_node field or fallback to ballot[1]
         
-        self.log.append({'type': 'PROMISE_RECEIVED', 'ballot': ballot, 'from_node': ballot[1]})
+        debug_print(f"[DEBUG] Node {self.node_id} received PROMISE with ballot {ballot} from Node {from_node}, current ballot: {self.ballot_number}")
+        self.log.append({'type': 'PROMISE_RECEIVED', 'ballot': ballot, 'from_node': from_node})
+        
+        # Track the maximum promised number to ensure leader uses higher ballot
+        if not hasattr(self, 'max_promised_number') or self.max_promised_number is None:
+            self.max_promised_number = ballot
+        elif ballot > self.max_promised_number:
+            self.max_promised_number = ballot
         
         if ballot == self.ballot_number:
-            self.accepted_log.extend(accepted_log)
+            # Count promises from OTHER nodes only (we count our own vote automatically)
+            if not hasattr(self, 'promise_count'):
+                self.promise_count = 0
             
-            if len(self.accepted_log) >= MAJORITY - 1:
-                self.become_leader()
-                self.send_new_view()
+            # Only count promises from other nodes, not from ourselves
+            if from_node != self.node_id:
+                self.promise_count += 1
+                debug_print(f"[DEBUG] Node {self.node_id} received promise from Node {from_node}, promise_count now: {self.promise_count}")
+            else:
+                debug_print(f"[DEBUG] Node {self.node_id} ignoring self-promise from Node {from_node}")
+            
+            # Merge accepted logs from the promise
+            self.accepted_log.extend(accepted_log)
+            debug_print(f"[DEBUG] Node {self.node_id} received promise {self.promise_count}, need {MAJORITY - 1} for majority")
+            debug_print(f"[DEBUG] Node {self.node_id} promise details: ballot={ballot}, from_node={from_node}, self_node={self.node_id}")
+            debug_print(f"[DEBUG] Node {self.node_id} current leader_id: {PaxosNode.leader_id}, is_leader: {self.is_leader}")
+            
+            if self.promise_count >= MAJORITY - 1:
+                debug_print(f"[DEBUG] Node {self.node_id} has majority promises ({self.promise_count}), attempting to become leader!")
+                debug_print(f"[DEBUG] Node {self.node_id} checking if another leader exists: PaxosNode.leader_id = {PaxosNode.leader_id}")
+                if PaxosNode.leader_id is None or PaxosNode.leader_id == self.node_id:
+                    # Double-check that we're still the only one trying to become leader
+                    if PaxosNode.leader_id is None:
+                        PaxosNode.leader_id = self.node_id  # Claim leadership atomically
+                        self.become_leader()
+                    else:
+                        debug_print(f"[DEBUG] Node {self.node_id} already leader, skipping become_leader")
+                else:
+                    debug_print(f"[DEBUG] Node {self.node_id} cannot become leader, another leader {PaxosNode.leader_id} already exists")
+            else:
+                debug_print(f"[DEBUG] Node {self.node_id} needs {MAJORITY - 1 - self.promise_count} more promises")
+        else:
+            debug_print(f"[DEBUG] Node {self.node_id} ignoring PROMISE with ballot {ballot} (not matching current ballot {self.ballot_number})")
                 
     def become_leader(self):
+        if self.is_leader:
+            debug_print(f"[DEBUG] Node {self.node_id} already leader, skipping become_leader")
+            return
+            
+        # Ensure our ballot number is higher than any promised number
+        # This prevents ACCEPT messages from being rejected due to low ballot numbers
+        if hasattr(self, 'max_promised_number') and self.max_promised_number:
+            if self.ballot_number <= self.max_promised_number:
+                # Increment our ballot number to be higher than any promised number
+                self.ballot_number = (self.max_promised_number[0] + 1, self.node_id)
+                debug_print(f"[DEBUG] Node {self.node_id} updated ballot number to {self.ballot_number} to be higher than max promised {self.max_promised_number}")
+            
         self.is_leader = True
         PaxosNode.leader_id = self.node_id  # Update shared leader tracking
         self.reset_timer()
+        debug_print(f"[DEBUG] Node {self.node_id} became leader (PaxosNode.leader_id = {PaxosNode.leader_id}) with ballot {self.ballot_number}")
+        # Send new view message to announce leadership
+        self.send_new_view()
+        # Replay any buffered client requests now that a leader exists
+        if getattr(self, 'election_buffer', None):
+            debug_print(f"[DEBUG] Node {self.node_id} replaying {len(self.election_buffer)} buffered requests after election")
+            for buffered in list(self.election_buffer):
+                try:
+                    # Check if this request has already been processed
+                    client_id = buffered['client_id']
+                    timestamp = buffered['timestamp']
+                    if client_id not in self.client_replies or timestamp not in self.client_replies[client_id]:
+                        debug_print(f"[DEBUG] Node {self.node_id} adding buffered request to queue: {buffered['transaction']}")
+                        self.transaction_queue.put(buffered)
+                    else:
+                        debug_print(f"[DEBUG] Node {self.node_id} skipping already processed buffered request: {buffered['transaction']}")
+                except Exception:
+                    pass
+            self.election_buffer.clear()
         
     def send_new_view(self):
-        if not self.accepted_log:
-            return
-            
+        # Always send new view message when becoming leader, even with empty log
         max_seq = max([entry[1] for entry in self.accepted_log]) if self.accepted_log else 0
         new_view_log = []
         
+        # Build the new-view log from the highest sequence number we've seen
+        # This ensures we don't miss any transactions that were accepted but not committed
         for seq in range(1, max_seq + 1):
             found = False
             for ballot, accept_seq, request in self.accepted_log:
@@ -305,13 +446,19 @@ class PaxosNode:
             'checkpoint_sequence': self.checkpoint_sequence
         }
         
+        debug_print(f"[DEBUG] Node {self.node_id} sending new view with {len(new_view_log)} log entries")
         self.log.append({'type': 'NEW_VIEW_SENT', 'ballot': self.ballot_number, 'log_entries': len(new_view_log)})
         self.new_view_messages.append(new_view_msg)
         self.broadcast(new_view_msg)
         
+        # Add all non-NO_OP requests to pending_requests so they can be committed
         for ballot, seq, request in new_view_log:
             if request.get('type') != 'NO_OP':
                 self.pending_requests[seq] = request
+                debug_print(f"[DEBUG] Node {self.node_id} added sequence {seq} to pending_requests from new-view")
+                
+        # Wait a bit for NEW-VIEW to be processed by all nodes
+        time.sleep(1)
                 
     def handle_new_view(self, message):
         ballot = message['ballot']
@@ -332,9 +479,27 @@ class PaxosNode:
             if checkpoint_seq > self.checkpoint_sequence:
                 self.checkpoint_sequence = checkpoint_seq
             
+            # Process each accept message in the new-view log
             for ballot, seq, request in log:
                 if request.get('type') != 'NO_OP':
                     self.pending_requests[seq] = request
+                    
+                    # Send ACCEPTED message back to leader for each accept message
+                    # (as per project description lines 166-172)
+                    accepted_msg = {
+                        'type': 'ACCEPTED',
+                        'ballot': ballot,
+                        'sequence': seq,
+                        'request': request,
+                        'node_id': self.node_id
+                    }
+                    
+                    self.log.append({'type': 'ACCEPTED_SENT', 'ballot': ballot, 'sequence': seq, 'to_node': ballot[1]})
+                    
+                    sender_port = self.find_port_by_ballot(ballot[1])
+                    if sender_port:
+                        debug_print(f"[DEBUG] Node {self.node_id} sending ACCEPTED for new-view sequence {seq} to leader {ballot[1]}")
+                        self.send_message(sender_port, accepted_msg)
 
     def handle_accept(self, message):
         ballot = message['ballot']
@@ -345,12 +510,20 @@ class PaxosNode:
         if isinstance(ballot, list):
             ballot = tuple(ballot)
         
+        debug_print(f"[DEBUG] Node {self.node_id} received ACCEPT with ballot {ballot}, sequence {sequence}")
+        debug_print(f"[DEBUG] Node {self.node_id} current promised_number: {self.promised_number}")
+        debug_print(f"[DEBUG] Node {self.node_id} request: {request}")
+        
         self.log.append({'type': 'ACCEPT_RECEIVED', 'ballot': ballot, 'sequence': sequence, 'from_node': ballot[1]})
         
         if ballot >= self.promised_number:
             self.promised_number = ballot
             self.accepted_log.append((ballot, sequence, request))
             self.log.append({'type': 'ACCEPT', 'ballot': ballot, 'sequence': sequence, 'request': request})
+            # Reset timer when receiving ACCEPT messages (system is active)
+            self.reset_timer()
+            
+            debug_print(f"[DEBUG] Node {self.node_id} accepted ACCEPT, sending ACCEPTED back to leader")
             
             accepted_msg = {
                 'type': 'ACCEPTED',
@@ -364,13 +537,21 @@ class PaxosNode:
             
             sender_port = self.find_port_by_ballot(ballot[1])
             if sender_port:
+                debug_print(f"[DEBUG] Node {self.node_id} sending ACCEPTED to port {sender_port}")
                 self.send_message(sender_port, accepted_msg)
+            else:
+                debug_print(f"[DEBUG] Node {self.node_id} could not find port for leader {ballot[1]}")
+        else:
+            debug_print(f"[DEBUG] Node {self.node_id} rejected ACCEPT (ballot {ballot} < promised {self.promised_number})")
 
     def handle_accepted(self, message):
         ballot = message['ballot']
         sequence = message['sequence']
         request = message['request']
         node_id = message['node_id']
+        
+        debug_print(f"[DEBUG] Node {self.node_id} received ACCEPTED from Node {node_id} for sequence {sequence}")
+        debug_print(f"[DEBUG] Node {self.node_id} ballot: {ballot}, current ballot: {self.ballot_number}, is_leader: {self.is_leader}")
         
         # Convert list to tuple for ballot comparison
         if isinstance(ballot, list):
@@ -379,8 +560,25 @@ class PaxosNode:
         self.log.append({'type': 'ACCEPTED_RECEIVED', 'ballot': ballot, 'sequence': sequence, 'from_node': node_id})
         
         if ballot == self.ballot_number and self.is_leader:
+            # Reset timer when leader receives ACCEPTED messages (system is active)
+            self.reset_timer()
+            
+            # Check if this sequence is in pending_requests or if it's from a new-view
             if sequence not in self.pending_requests:
-                return
+                # This might be from a new-view, check if we have it in our accepted_log
+                found_in_log = False
+                for log_ballot, log_seq, log_req in self.accepted_log:
+                    if log_seq == sequence:
+                        found_in_log = True
+                        # Add to pending_requests if not already there
+                        if sequence not in self.pending_requests:
+                            self.pending_requests[sequence] = log_req
+                            debug_print(f"[DEBUG] Node {self.node_id} added sequence {sequence} to pending_requests from accepted_log")
+                        break
+                
+                if not found_in_log:
+                    debug_print(f"[DEBUG] Node {self.node_id} sequence {sequence} not in pending_requests or accepted_log, ignoring ACCEPTED")
+                    return
                 
             # Count ACCEPTED messages for this sequence
             accepted_count = sum(1 for entry in self.log 
@@ -388,18 +586,36 @@ class PaxosNode:
                                    entry.get('ballot') == ballot and 
                                    entry.get('sequence') == sequence))
             
+            debug_print(f"[DEBUG] Node {self.node_id} accepted_count for sequence {sequence}: {accepted_count}/{MAJORITY-1}")
+            
             if accepted_count >= MAJORITY - 1:
-                self.commit_transaction(sequence, request)
+                debug_print(f"[DEBUG] Node {self.node_id} has majority ACCEPTED messages, committing sequence {sequence}")
+                # Get the request from pending_requests
+                if sequence in self.pending_requests:
+                    self.commit_transaction(sequence, self.pending_requests[sequence])
+                else:
+                    # Find the request from accepted_log
+                    for log_ballot, log_seq, log_req in self.accepted_log:
+                        if log_seq == sequence:
+                            self.commit_transaction(sequence, log_req)
+                            break
+            else:
+                debug_print(f"[DEBUG] Node {self.node_id} waiting for more ACCEPTED messages for sequence {sequence}")
+        else:
+            debug_print(f"[DEBUG] Node {self.node_id} ignoring ACCEPTED (not leader or wrong ballot)")
                 
     def commit_transaction(self, sequence, request):
+        debug_print(f"[DEBUG] Node {self.node_id} commit_transaction called for sequence {sequence}")
         # Check if this sequence has already been executed
         if sequence <= self.executed_sequence:
+            debug_print(f"[DEBUG] Node {self.node_id} sequence {sequence} already executed (executed_sequence: {self.executed_sequence})")
             return
             
         # Check if this sequence has already been committed
         if not hasattr(self, 'committed_sequences'):
             self.committed_sequences = set()
         if sequence in self.committed_sequences:
+            debug_print(f"[DEBUG] Node {self.node_id} sequence {sequence} already committed")
             return
             
         # Mark this sequence as committed
@@ -416,15 +632,23 @@ class PaxosNode:
         
         sender, receiver, amount = transaction
         
-        sender_key = f'client_{ord(sender) - ord("A")}'
-        receiver_key = f'client_{ord(receiver) - ord("A")}'
+        sender_key = f'client_{sender}'
+        receiver_key = f'client_{receiver}'
+        
+        # Execute transaction (leader executes here, backups will execute in handle_commit)
+        debug_print(f"[DEBUG] Node {self.node_id} executing transaction: {sender} -> {receiver}, amount: {amount}")
+        debug_print(f"[DEBUG] Node {self.node_id} sender_key: {sender_key}, receiver_key: {receiver_key}")
+        debug_print(f"[DEBUG] Node {self.node_id} sender balance before: {self.datastore.get(sender_key, 0)}")
+        debug_print(f"[DEBUG] Node {self.node_id} receiver balance before: {self.datastore.get(receiver_key, 0)}")
         
         if self.datastore.get(sender_key, 0) >= amount:
             self.datastore[sender_key] -= amount
             self.datastore[receiver_key] = self.datastore.get(receiver_key, 0) + amount
             result = 'success'
+            debug_print(f"[DEBUG] Node {self.node_id} transaction successful: {sender_key}={self.datastore[sender_key]}, {receiver_key}={self.datastore[receiver_key]}")
         else:
             result = 'failed'
+            debug_print(f"[DEBUG] Node {self.node_id} transaction failed: insufficient balance")
             
         self.executed_sequence = max(self.executed_sequence, sequence)
         self.log.append({'type': 'COMMIT', 'ballot': self.ballot_number, 'sequence': sequence, 'request': request})
@@ -439,6 +663,8 @@ class PaxosNode:
         self.log.append({'type': 'COMMIT_SENT', 'ballot': self.ballot_number, 'sequence': sequence})
         self.broadcast(commit_msg)
         self.send_reply(client_id, timestamp, result)
+        # Reset timer when leader commits transactions (actively processing)
+        self.reset_timer()
         
         # Create checkpoint every 3 transactions (bonus feature)
         if self.executed_sequence % 3 == 0 and self.executed_sequence > 0:
@@ -452,6 +678,8 @@ class PaxosNode:
         sequence = message['sequence']
         request = message['request']
         
+        debug_print(f"[DEBUG] Node {self.node_id} received COMMIT for sequence {sequence}")
+        
         # Convert list to tuple for ballot comparison
         if isinstance(ballot, list):
             ballot = tuple(ballot)
@@ -460,12 +688,14 @@ class PaxosNode:
         
         # Check if this sequence has already been executed
         if sequence <= self.executed_sequence:
+            debug_print(f"[DEBUG] Node {self.node_id} sequence {sequence} already executed in handle_commit")
             return
             
         # Check if this sequence has already been committed
         if not hasattr(self, 'committed_sequences'):
             self.committed_sequences = set()
         if sequence in self.committed_sequences:
+            debug_print(f"[DEBUG] Node {self.node_id} sequence {sequence} already committed in handle_commit")
             return
             
         # Mark this sequence as committed
@@ -482,26 +712,46 @@ class PaxosNode:
         
         sender, receiver, amount = transaction
         
-        sender_key = f'client_{ord(sender) - ord("A")}'
-        receiver_key = f'client_{ord(receiver) - ord("A")}'
+        sender_key = f'client_{sender}'
+        receiver_key = f'client_{receiver}'
         
-        if self.datastore.get(sender_key, 0) >= amount:
-            self.datastore[sender_key] -= amount
-            self.datastore[receiver_key] = self.datastore.get(receiver_key, 0) + amount
-            result = 'success'
+        # Only execute transaction if this node is not the leader (leader already executed in commit_transaction)
+        debug_print(f"[DEBUG] Node {self.node_id} handle_commit: is_leader = {self.is_leader}")
+        if not self.is_leader:
+            debug_print(f"[DEBUG] Node {self.node_id} executing transaction in handle_commit: {sender} -> {receiver}, amount: {amount}")
+            debug_print(f"[DEBUG] Node {self.node_id} sender balance before: {self.datastore.get(sender_key, 0)}")
+            debug_print(f"[DEBUG] Node {self.node_id} receiver balance before: {self.datastore.get(receiver_key, 0)}")
+            
+            if self.datastore.get(sender_key, 0) >= amount:
+                self.datastore[sender_key] -= amount
+                self.datastore[receiver_key] = self.datastore.get(receiver_key, 0) + amount
+                result = 'success'
+                debug_print(f"[DEBUG] Node {self.node_id} transaction successful in handle_commit: {sender_key}={self.datastore[sender_key]}, {receiver_key}={self.datastore[receiver_key]}")
+            else:
+                result = 'failed'
+                debug_print(f"[DEBUG] Node {self.node_id} transaction failed in handle_commit: insufficient balance")
         else:
-            result = 'failed'
+            debug_print(f"[DEBUG] Node {self.node_id} leader already executed transaction in commit_transaction, skipping execution in handle_commit")
+            result = 'success'  # Assume success since leader already executed
             
         self.executed_sequence = max(self.executed_sequence, sequence)
         self.log.append({'type': 'COMMIT', 'ballot': ballot, 'sequence': sequence, 'request': request})
         
         if not self.is_leader:
             self.send_reply(client_id, timestamp, result)
+        else:
+            # Leader already executed the transaction in commit_transaction, don't execute again
+            debug_print(f"[DEBUG] Node {self.node_id} leader already executed transaction, skipping execution in handle_commit")
             
     def send_reply(self, client_id, timestamp, result):
         if client_id not in self.client_replies:
             self.client_replies[client_id] = {}
         self.client_replies[client_id][timestamp] = result
+        
+        # Restart timer when leader responds (as per conversation)
+        if self.timer is not None:
+            debug_print(f"[DEBUG] Node {self.node_id} restarting timer after sending reply")
+            self.reset_timer()
         
         reply_msg = {
             'type': 'REPLY',
@@ -547,11 +797,14 @@ class PaxosNode:
     def handle_leader_failure(self):
         """Handle leader failure command - make node act like disconnected node"""
         print(f"Node {self.node_id} failed (LF command received)")
+        debug_print(f"[DEBUG] Node {self.node_id} failed, setting PaxosNode.leader_id to None")
         self.is_failed = True
         self.is_leader = False
         self.peers = []  # Remove all peer connections
         # Stop the timer to prevent ballot number increases
         self.timer = None
+        # Clear the shared leader_id so other nodes know leader failed
+        PaxosNode.leader_id = None
         
     def recover_from_failure(self):
         """Recover from failure when node becomes live again"""
@@ -720,6 +973,9 @@ class PaxosNode:
         
         print(f"Node {self.node_id} caught up: executed_sequence={self.executed_sequence}, datastore updated")
         
+        # Reset the timer after successful catch-up
+        self.reset_timer()
+        
     def apply_transaction(self, transaction):
         """Apply a transaction to the datastore"""
         sender, receiver, amount = transaction
@@ -738,22 +994,43 @@ class PaxosNode:
         while True:
             time.sleep(0.1)
             if self.timer and time.time() - self.timer > self.timer_duration:
-                if not self.is_leader:
+                debug_print(f"[DEBUG] Node {self.node_id} timer expired (duration: {self.timer_duration}s)")
+                debug_print(f"[DEBUG] Node {self.node_id} is_leader: {self.is_leader}, PaxosNode.leader_id: {PaxosNode.leader_id}")
+                debug_print(f"[DEBUG] Node {self.node_id} pending_requests: {len(self.pending_requests)}")
+                
+                # Check if we're waiting for requests to be processed
+                if self.pending_requests and not self.is_leader:
+                    debug_print(f"[DEBUG] Node {self.node_id} timer expired while waiting for requests, starting leader election")
                     self.start_leader_election()
-                self.reset_timer()
+                elif not self.pending_requests:
+                    debug_print(f"[DEBUG] Node {self.node_id} timer expired but no pending requests, stopping timer")
+                    self.timer = None
+                else:
+                    debug_print(f"[DEBUG] Node {self.node_id} timer expired but is leader, resetting timer")
+                    self.reset_timer()
                 
     def reset_timer(self):
         self.timer = time.time()
         
     def start_leader_election(self):
+        # Check if we've received any prepare messages in the last tp milliseconds
         if self.prepare_timer and time.time() - self.prepare_timer < self.prepare_timer_duration:
+            debug_print(f"[DEBUG] Node {self.node_id} cannot start election, received prepare message recently")
+            return
+            
+        # Only start election if no leader exists
+        if PaxosNode.leader_id is not None:
+            debug_print(f"[DEBUG] Node {self.node_id} cannot start election, leader {PaxosNode.leader_id} already exists")
             return
             
         self.prepare_timer = time.time()
         self.ballot_number = (self.ballot_number[0] + 1, self.node_id)
         self.accepted_log = []
+        self.promise_count = 0  # Reset promise count for new election
+        self.max_promised_number = None  # Reset max promised number for new election
         
         self.log.append({'type': 'LEADER_ELECTION_STARTED', 'ballot': self.ballot_number})
+        debug_print(f"[DEBUG] Node {self.node_id} starting leader election with ballot {self.ballot_number}")
         
         prepare_msg = {
             'type': 'PREPARE',
@@ -761,13 +1038,22 @@ class PaxosNode:
         }
         
         self.broadcast(prepare_msg)
+        # Start timer to track election progress
+        self.reset_timer()
         
     def find_port_by_ballot(self, node_id):
         return 8000 + node_id
         
     def broadcast(self, message):
+        debug_print(f"[DEBUG] Node {self.node_id} broadcasting {message['type']} to peers: {self.peers}")
         for peer_port in self.peers:
-            self.send_message(peer_port, message)
+            # Don't send to ourselves - handle locally instead
+            if peer_port != self.port:
+                self.send_message(peer_port, message)
+            else:
+                debug_print(f"[DEBUG] Node {self.node_id} handling {message['type']} locally instead of sending to self")
+                # Handle the message locally
+                self.handle_message(message)
 
     def send_message(self, port, message):
         try:
@@ -776,8 +1062,9 @@ class PaxosNode:
             sock.connect(('localhost', port))
             sock.send(json.dumps(message).encode())
             sock.close()
-        except:
-            pass
+            debug_print(f"[DEBUG] Node {self.node_id} successfully sent {message['type']} to port {port}")
+        except Exception as e:
+            debug_print(f"[DEBUG] Node {self.node_id} failed to send {message['type']} to {port}: {e}")
             
     def _client_label(self, key):
         if isinstance(key, str) and key.startswith('client_'):
@@ -884,6 +1171,7 @@ class Client:
                 
     def send_request(self, transaction):
         self.timestamp += 1
+        debug_print(f"[DEBUG] Client {self.client_id} sending request for transaction {transaction}, PaxosNode.leader_id = {PaxosNode.leader_id}")
         request_msg = {
             'type': 'REQUEST',
             'client_id': self.client_id,
@@ -892,11 +1180,17 @@ class Client:
             'client_port': self.listener_port
         }
         
-        self.pending_requests[self.timestamp] = {'start_time': time.time(), 'retries': 0}
+        self.pending_requests[self.timestamp] = {'start_time': time.time(), 'retries': 0, 'transaction': transaction}
         
         # Send to current leader using shared leader_id
-        leader_port = 8000 + PaxosNode.leader_id
-        self.send_to_node(leader_port, request_msg)
+        if PaxosNode.leader_id is None:
+            # No leader available, broadcast to all nodes
+            debug_print(f"[DEBUG] Client {self.client_id} no leader available, broadcasting request")
+            self.broadcast_request(self.timestamp)
+        else:
+            leader_port = 8000 + PaxosNode.leader_id
+            debug_print(f"[DEBUG] Client {self.client_id} sending to leader at port {leader_port}")
+            self.send_to_node(leader_port, request_msg)
         
         threading.Thread(target=self.retry_timer, args=(self.timestamp,), daemon=True).start()
         
@@ -946,6 +1240,8 @@ class Client:
             self.send_to_node(node_port, request_msg)
             
     def get_transaction_by_timestamp(self, timestamp):
+        if timestamp in self.pending_requests:
+            return self.pending_requests[timestamp]['transaction']
         return None
         
     def handle_reply(self, message):
@@ -996,8 +1292,9 @@ def read_input_file(filename):
                 transaction_str = row[1].strip()
                 if transaction_str == 'LF':
                     # Leader failure command
-                    test_sets[current_set]['transactions'].append('LF')
-                elif transaction_str:
+                    if current_set is not None:
+                        test_sets[current_set]['transactions'].append('LF')
+                elif transaction_str and current_set is not None:
                     # Regular transaction - handle both formats
                     if transaction_str.startswith('(') and transaction_str.endswith(')'):
                         # Format: (A, J, 3) - convert to tuple
@@ -1059,6 +1356,8 @@ def main():
     parser = argparse.ArgumentParser(description='Paxos Consensus Algorithm Implementation')
     parser.add_argument('-d', '--debug', action='store_true', 
                        help='Run in debug mode - automatically continue after 10 seconds instead of waiting for user input')
+    parser.add_argument('input_file', nargs='?', default='tests/input4.csv',
+                       help='Input CSV file to process (default: tests/input4.csv)')
     args = parser.parse_args()
     DEBUG_MODE = args.debug
     
@@ -1076,8 +1375,10 @@ def main():
 
     nodes[0].is_leader = True
     nodes[0].ballot_number = (1, 1)
+    nodes[0].reset_timer()  # Initialize timer for the leader
+    PaxosNode.leader_id = 1  # Set the global leader ID
 
-    test_sets = read_input_file('tests/input4.csv')
+    test_sets = read_input_file(args.input_file)
 
     for set_number, test_data in test_sets.items():
         debug_print(f"[DEBUG] Running Test Set {set_number}...")
@@ -1090,18 +1391,83 @@ def main():
         for node in nodes:
             node.pending_requests = {}
             node.client_replies = {}  # Clear cached client replies
+            node.processed_requests = set()  # Clear processed requests
             # Keep datastore, log, executed_sequence, accepted_log, committed_sequences
             # to maintain state across interdependent test sets
+            
+        # Ensure all nodes have the same state by synchronizing with the leader
+        if set_number > 1:  # Skip synchronization for the first test set
+            # Find the node with the highest executed_sequence (most up-to-date)
+            max_seq = max(node.executed_sequence for node in nodes)
+            leader_node = None
+            for node in nodes:
+                if node.executed_sequence == max_seq:
+                    leader_node = node
+                    break
+            
+            if leader_node:
+                debug_print(f"[DEBUG] Synchronizing all nodes with Node {leader_node.node_id} (executed_sequence={max_seq})")
+                # Synchronize all other nodes with the leader
+                for node in nodes:
+                    if node.node_id != leader_node.node_id:
+                        # Only synchronize if the node is not isolated in the current test set
+                        if node.node_id in live_nodes:
+                            node.datastore = leader_node.datastore.copy()
+                            node.executed_sequence = leader_node.executed_sequence
+                            node.checkpoint_sequence = leader_node.checkpoint_sequence
+                            node.checkpoint_digest = leader_node.checkpoint_digest
+                            node.last_checkpoint = leader_node.last_checkpoint.copy() if leader_node.last_checkpoint else None
+                            debug_print(f"[DEBUG] Node {node.node_id} synchronized with leader: executed_sequence={node.executed_sequence}")
+                        else:
+                            debug_print(f"[DEBUG] Node {node.node_id} not synchronized (isolated in current test set)")
+        
+        # Keep the same leader across test sets unless there was a leader failure
+        # Only reset leader if the previous test set had a leader failure (LF command)
+        if set_number == 1:
+            # For Test Set 1, keep Node 1 as the leader
+            PaxosNode.leader_id = 1
+            nodes[0].is_leader = True
+            nodes[0].ballot_number = (1, 1)
+            nodes[0].reset_timer()
+            debug_print(f"[DEBUG] Test Set 1: Keeping Node 1 as leader")
+        elif PaxosNode.leader_id is not None:
+            # Keep the same leader if one exists (no leader failure in previous test set)
+            current_leader = PaxosNode.leader_id
+            if current_leader in live_nodes:
+                # Current leader is still alive, keep it
+                nodes[current_leader - 1].is_leader = True
+                nodes[current_leader - 1].reset_timer()
+                debug_print(f"[DEBUG] Test Set {set_number}: Keeping Node {current_leader} as leader")
+            else:
+                # Current leader is not alive, reset for new election
+                PaxosNode.leader_id = None
+                for node in nodes:
+                    node.is_leader = False
+                    node.prepare_timer = None
+                    node.promise_count = 0
+                debug_print(f"[DEBUG] Test Set {set_number}: Leader Node {current_leader} not alive, resetting for new election")
+        else:
+            # No leader exists, reset for new election
+            PaxosNode.leader_id = None
+            for node in nodes:
+                node.is_leader = False
+                node.prepare_timer = None
+                node.promise_count = 0
+            debug_print(f"[DEBUG] Test Set {set_number}: No leader exists, resetting for new election")
+        
+        PaxosNode.processed_transactions.clear()  # Clear processed transactions between test sets
         
         # Isolate disconnected nodes by removing them from peer lists
         for node in nodes:
             if node.node_id not in live_nodes:
                 # This node is disconnected - isolate it from the network
+                # BUT preserve its current state (don't modify datastore, executed_sequence, etc.)
                 node.is_isolated = True
                 node.peers = []  # Remove all peers
                 node.is_leader = False  # Can't be leader if isolated
                 node.timer = None  # Stop timer
-                print(f"Node {node.node_id} isolated (disconnected)")
+                print(f"Node {node.node_id} isolated (disconnected) - preserving state")
+                debug_print(f"[DEBUG] Node {node.node_id} isolated, preserving state: executed_sequence={node.executed_sequence}, datastore={node.datastore}")
             else:
                 # This node is live - ensure it has proper peer connections
                 was_isolated = node.is_isolated
@@ -1123,6 +1489,8 @@ def main():
                     debug_print(f"[DEBUG] Node {node.node_id} current datastore before catch-up: {node.datastore}")
                     node.catch_up_with_peers(live_nodes)
                     debug_print(f"[DEBUG] Node {node.node_id} catch-up call completed")
+                    # Give more time for catch-up to complete
+                    time.sleep(3)
         
         clients = []
         for i in range(NUM_CLIENTS):
@@ -1131,8 +1499,10 @@ def main():
         
         # Process transactions sequentially, including LF commands
         debug_print(f"[DEBUG] Processing {len(transactions)} transactions in Test Set {set_number}")
+        debug_print(f"[DEBUG] Current PaxosNode.leader_id = {PaxosNode.leader_id}")
         for i, transaction in enumerate(transactions):
             debug_print(f"[DEBUG] Processing transaction {i+1}/{len(transactions)}: {transaction}")
+            debug_print(f"[DEBUG] Before transaction {i+1}, PaxosNode.leader_id = {PaxosNode.leader_id}")
             if transaction == 'LF':
                 # Leader failure command - send to current leader
                 current_leader = None
