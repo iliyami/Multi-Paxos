@@ -1,0 +1,90 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs and debug files
+*.log
+debug_*.log
+test_*.log
+final_test_*.log
+catchup_test*.log
+checkpoint_*.log
+leader_election_*.log
+verification_*.log
+normal_test.log
+clean_test.log
+
+# Temporary files
+*.tmp
+*.temp
+/tmp/
+/temp/
+
+# Database files
+dbs/
+*.db
+*.sqlite
+*.sqlite3
+
+# Test results and outputs
+database_results.txt
+test_output.log
+/tmp/
+
+# Backup files
+*_backup.py
+*_backup2.py
+*_clean.py
+*_fixed.py
+*_queued.py
+
+# PDF files (if not needed in repo)
+*.pdf
+
+# CSV test files (keep input files, ignore generated ones)
+# Keep: tests/input*.csv
+# Ignore: generated test files
+*_debug.csv
+*_verification.csv
