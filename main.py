@@ -14,7 +14,6 @@ NUM_CLIENTS = 10
 INITIAL_BALANCE = 10
 MAJORITY = NUM_NODES // 2 + 1
 
-# Global debug flag
 DEBUG_MODE = False
 
 def debug_print(message):
@@ -23,12 +22,10 @@ def debug_print(message):
         print(message)
 
 class PaxosNode:
-    # Shared class variable to track the current leader
     leader_id = 1
-    # Shared set to track processed transactions globally
     processed_transactions = set()
-    # Shared sequence number across all nodes
-    global_sequence_number = 1
+    seq_n = 1
+    all_nodes = []
     
     def __init__(self, node_id, port, peers):
         self.node_id = node_id
@@ -228,12 +225,8 @@ class PaxosNode:
         
         debug_print(f"[DEBUG] Node {self.node_id} processing single transaction: {transaction}")
         
-        # Note: We'll rely on sequence-based deduplication instead of global transaction deduplication
-        # to avoid issues with transactions across different test sets
-        
-        # Assign sequence number from shared global counter
-        current_seq = PaxosNode.global_sequence_number
-        PaxosNode.global_sequence_number += 1
+        current_seq = PaxosNode.seq_n
+        PaxosNode.seq_n += 1
         
         debug_print(f"[DEBUG] Node {self.node_id} generated sequence {current_seq} for transaction {transaction}")
         
@@ -274,8 +267,6 @@ class PaxosNode:
         self.send_message(leader_port, message)
             
     def find_leader_port(self):
-        # Use the shared leader_id to get the leader's port
-        # No need to check connectivity since leader is always accessible
         if PaxosNode.leader_id is None:
             return None
         return 8000 + PaxosNode.leader_id
@@ -400,7 +391,7 @@ class PaxosNode:
                 debug_print(f"[DEBUG] Node {self.node_id} updated ballot number to {self.ballot_number} to be higher than max promised {self.max_promised_number}")
             
         self.is_leader = True
-        PaxosNode.leader_id = self.node_id  # Update shared leader tracking
+        PaxosNode.leader_id = self.node_id
         self.reset_timer()
         debug_print(f"[DEBUG] Node {self.node_id} became leader (PaxosNode.leader_id = {PaxosNode.leader_id}) with ballot {self.ballot_number}")
         # Send new view message to announce leadership
@@ -472,7 +463,6 @@ class PaxosNode:
             self.accepted_log = [(ballot, seq, req) for ballot, seq, req in log]
             self.new_view_messages.append(message)
             
-            # Update shared leader tracking
             PaxosNode.leader_id = ballot[1]
             
             # Update checkpoint sequence if higher
@@ -803,8 +793,15 @@ class PaxosNode:
         self.peers = []  # Remove all peer connections
         # Stop the timer to prevent ballot number increases
         self.timer = None
-        # Clear the shared leader_id so other nodes know leader failed
+    
         PaxosNode.leader_id = None
+        
+        # Remove this failed node from all other nodes' peer lists
+        failed_node_port = 8000 + self.node_id
+        for node in PaxosNode.all_nodes:
+            if node.node_id != self.node_id and failed_node_port in node.peers:
+                node.peers.remove(failed_node_port)
+                debug_print(f"[DEBUG] Removed failed Node {self.node_id} (port {failed_node_port}) from Node {node.node_id} peers")
         
     def recover_from_failure(self):
         """Recover from failure when node becomes live again"""
@@ -1024,7 +1021,10 @@ class PaxosNode:
             return
             
         self.prepare_timer = time.time()
-        self.ballot_number = (self.ballot_number[0] + 1, self.node_id)
+        # Generate a ballot number higher than any promised number
+        # Use the maximum of current ballot and promised number, then increment
+        max_ballot_num = max(self.ballot_number[0], self.promised_number[0] if self.promised_number else 0)
+        self.ballot_number = (max_ballot_num + 1, self.node_id)
         self.accepted_log = []
         self.promise_count = 0  # Reset promise count for new election
         self.max_promised_number = None  # Reset max promised number for new election
@@ -1182,7 +1182,6 @@ class Client:
         
         self.pending_requests[self.timestamp] = {'start_time': time.time(), 'retries': 0, 'transaction': transaction}
         
-        # Send to current leader using shared leader_id
         if PaxosNode.leader_id is None:
             # No leader available, broadcast to all nodes
             debug_print(f"[DEBUG] Client {self.client_id} no leader available, broadcasting request")
@@ -1369,6 +1368,7 @@ def main():
         node = PaxosNode(i + 1, ports[i], peers)
         node.start_server()
         nodes.append(node)
+        PaxosNode.all_nodes.append(node)
         time.sleep(0.1)
 
     time.sleep(2)
@@ -1376,7 +1376,7 @@ def main():
     nodes[0].is_leader = True
     nodes[0].ballot_number = (1, 1)
     nodes[0].reset_timer()  # Initialize timer for the leader
-    PaxosNode.leader_id = 1  # Set the global leader ID
+    PaxosNode.leader_id = 1
 
     test_sets = read_input_file(args.input_file)
 
@@ -1456,6 +1456,10 @@ def main():
             debug_print(f"[DEBUG] Test Set {set_number}: No leader exists, resetting for new election")
         
         PaxosNode.processed_transactions.clear()  # Clear processed transactions between test sets
+        
+        # Clear election buffers for all nodes between test sets
+        for node in nodes:
+            node.election_buffer.clear()
         
         # Isolate disconnected nodes by removing them from peer lists
         for node in nodes:
