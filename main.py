@@ -1150,7 +1150,21 @@ class PaxosNode:
     def print_view(self):
         print(f"Node {self.node_id} New-View Messages:")
         for i, view_msg in enumerate(self.new_view_messages):
-            print(f"  View {i+1}: Ballot {view_msg['ballot']}, Log entries: {len(view_msg['log'])}")
+            print(f"  View {i+1}: Ballot {view_msg['ballot']}, Checkpoint Sequence: {view_msg.get('checkpoint_sequence', 0)}")
+            print(f"    AcceptLog ({len(view_msg['log'])} entries):")
+            for j, (ballot, seq, request) in enumerate(view_msg['log']):
+                if request.get('type') == 'NO_OP':
+                    print(f"      Entry {j+1}: Ballot {ballot}, Sequence {seq}, Request: NO_OP")
+                else:
+                    # Extract transaction details from the request structure
+                    transaction = request.get('transaction', [])
+                    if isinstance(transaction, list) and len(transaction) >= 3:
+                        sender = transaction[0]
+                        receiver = transaction[1]
+                        amount = transaction[2]
+                        print(f"      Entry {j+1}: Ballot {ballot}, Sequence {seq}, Request: ({sender}, {receiver}, {amount})")
+                    else:
+                        print(f"      Entry {j+1}: Ballot {ballot}, Sequence {seq}, Request: {request}")
             
     def print_checkpoint(self):
         print(f"Node {self.node_id} Checkpoint Info:")

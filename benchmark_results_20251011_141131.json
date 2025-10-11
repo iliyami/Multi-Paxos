@@ -1,0 +1,42 @@
+{
+  "throughput": {
+    "test_type": "throughput",
+    "results": [
+      {
+        "workload_size": 50,
+        "throughput": 15.842429213830115,
+        "execution_time": 2.587986946105957,
+        "success_rate": 100.0
+      },
+      {
+        "workload_size": 100,
+        "throughput": 32.99638486149775,
+        "execution_time": 2.6063461303710938,
+        "success_rate": 100.0
+      },
+      {
+        "workload_size": 200,
+        "throughput": 64.62349367038456,
+        "execution_time": 2.5996737480163574,
+        "success_rate": 100.0
+      },
+      {
+        "workload_size": 500,
+        "throughput": 159.7143703717807,
+        "execution_time": 2.604649782180786,
+        "success_rate": 100.0
+      },
+      {
+        "workload_size": 1000,
+        "throughput": 330.4975032951785,
+        "execution_time": 2.5870089530944824,
+        "success_rate": 100.0
+      }
+    ],
+    "summary": {
+      "max_throughput": 330.4975032951785,
+      "avg_throughput": 120.73483628253432,
+      "best_workload_size": 1000
+    }
+  }
+}

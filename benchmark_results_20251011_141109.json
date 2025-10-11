@@ -1,0 +1,42 @@
+{
+  "throughput": {
+    "test_type": "throughput",
+    "results": [
+      {
+        "workload_size": 50,
+        "throughput": 0.0,
+        "execution_time": 0.0,
+        "success_rate": 0.0
+      },
+      {
+        "workload_size": 100,
+        "throughput": 0.0,
+        "execution_time": 0.0,
+        "success_rate": 0.0
+      },
+      {
+        "workload_size": 200,
+        "throughput": 0.0,
+        "execution_time": 0.0,
+        "success_rate": 0.0
+      },
+      {
+        "workload_size": 500,
+        "throughput": 0.0,
+        "execution_time": 0.0,
+        "success_rate": 0.0
+      },
+      {
+        "workload_size": 1000,
+        "throughput": 0.0,
+        "execution_time": 0.0,
+        "success_rate": 0.0
+      }
+    ],
+    "summary": {
+      "max_throughput": 0.0,
+      "avg_throughput": 0.0,
+      "best_workload_size": 50
+    }
+  }
+}
