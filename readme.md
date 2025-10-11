@@ -1,78 +1,103 @@
-# Modified Paxos Consensus Protocol for Distributed Banking
+# Paxos Banking System with SmallBank Benchmark
 
-## Project Overview
+A distributed banking application implementing the Paxos consensus protocol for state machine replication, with comprehensive performance evaluation using the SmallBank benchmark.
 
-This project implements a variant of the Paxos consensus protocol for a distributed banking application. The system consists of 5 servers and 5 clients, where each server is responsible for processing transactions initiated by a single client.
+## Overview
+
+This project implements a fault-tolerant distributed banking system using the Paxos consensus algorithm. The system ensures that all banking transactions are consistently maintained across multiple nodes (replicas) through consensus-based state machine replication.
 
 ## Features
 
-- Modified Paxos consensus protocol implementation
-- Distributed transaction processing
-- Fault tolerance for up to 2 server failures
-- Catch-up mechanism for recovered servers
-- Local transaction logging and global datastore
+- **Paxos Consensus Protocol**: Implements leader election, normal operations, and node failure handling
+- **Distributed Banking**: Supports 10 clients (A-J) with transfer transactions
+- **Fault Tolerance**: Handles leader failures, node isolation, and recovery
+- **Checkpointing (Bonus 1)**: Periodic state saving for efficient recovery and log optimization
+- **SmallBank Benchmark (Bonus 2)**: Comprehensive performance evaluation framework
 
-## Requirements
+## System Architecture
 
-- Python 3.7+ (or your chosen programming language)
-- Network socket library (built-in)
+- **5 Paxos Nodes**: Distributed across ports 8001-8005
+- **10 Banking Clients**: Clients A through J with initial balance of 10 units each
+- **Leader-based Consensus**: Single leader coordinates all transactions
+- **Majority-based Decisions**: Requires 3 out of 5 nodes for consensus
 
-## Setup
+## Key Components
 
-1. Clone the repository:
+### Core Paxos Implementation (`main.py`)
+- Leader election with prepare/promise messages
+- Transaction processing with accept/accepted/commit phases
+- Node failure detection and recovery
+- State synchronization and catch-up mechanisms
+- **Checkpointing system** for efficient state recovery
 
+### SmallBank Benchmark
+- **`smallbank_benchmark.py`**: Generates realistic banking workloads
+- **`benchmark_evaluator.py`**: Performance metrics collection
+- **`run_benchmark.py`**: Comprehensive benchmark suite
+- **6 Transaction Types**: Amalgamate, Balance, DepositChecking, SendPayment, TransactSavings, WriteCheck
 
-2. Install dependencies:
+## Performance Results
 
-pip install -r requirements.txt
+The system achieves excellent performance with the SmallBank benchmark:
+- **Maximum Throughput**: 330.50 transactions/second
+- **Perfect Reliability**: 100% success rate across all tests
+- **Linear Scaling**: Throughput scales with workload size
+- **Consistent Execution**: ~2.6 seconds regardless of workload
 
 ## Usage
 
-1. Start the servers:
+### Run Basic Tests
+```bash
+python3 main.py tests/input4.csv -d
+```
 
-python main.py
+### Generate SmallBank Workload
+```bash
+python3 smallbank_benchmark.py
+```
 
-2. The program will read from an input CSV file containing sets of transactions.
+### Run Performance Benchmark
+```bash
+python3 run_benchmark.py --test throughput
+```
 
-3. Follow the prompts to process each set of transactions.
+### Run Comprehensive Benchmark
+```bash
+python3 run_benchmark.py --test all
+```
 
-4. Use the following commands between transaction sets:
-- `PrintBalance <server_id>`: Print the balance of a given client
-- `PrintLog <server_id>`: Print the local log of a given server
-- `PrintDB <server_id>`: Print the current datastore
-- `Performance`: Print throughput and latency metrics
+## Test Scenarios
 
-## Fix known setup issues
-1. Server failed to run due to used address
+The system handles various scenarios including:
+- Normal transaction processing
+- Leader failures and elections
+- Node isolation and recovery
+- Concurrent leader elections
+- Insufficient nodes for consensus
+- State synchronization after failures
 
-        sudo lsof -t -i:<port_num>
+## Files
 
-## Implementation Details
+- `main.py` - Core Paxos implementation
+- `smallbank_benchmark.py` - SmallBank benchmark implementation
+- `benchmark_evaluator.py` - Performance evaluation framework
+- `run_benchmark.py` - Benchmark runner
+- `tests/input4.csv` - Test scenarios
 
-- Each server maintains a local transaction log and a global datastore
-- The modified Paxos protocol is used for consensus when a client has insufficient balance
-- Catch-up mechanism implemented for synchronizing recovered or slow servers
-- Quorum construction with timeout for handling slow or crashed servers
-- Unique sequence numbers for maintaining log consistency
+## Bonus Implementations
 
-## Performance
+### Bonus 1: Checkpointing
+- **Periodic state saving** after every 100 committed requests
+- **Efficient recovery** using checkpoints instead of processing all previous requests
+- **Log optimization** with checkpoint-based catch-up mechanisms
+- **State synchronization** for failed nodes using checkpoint data
 
-The implementation aims to demonstrate reasonable performance in terms of throughput (transactions committed per second) and latency (average processing time per transaction).
+### Bonus 2: SmallBank Benchmark
+- **Comprehensive performance evaluation** using industry-standard benchmark
+- **Realistic banking workloads** with 6 transaction types and skewed access patterns
+- **Performance metrics** including throughput, latency, and consistency
+- **Scalability testing** with varying workload sizes and failure scenarios
 
-## Bonus Features (Optional)
+## Academic Context
 
-- [ ] Modified Multi-Paxos protocol
-- [X] Database integration for datastore
-- [X] Efficient balance retrieval across servers
-
-## Deadline
-
-This project is due on October 17, 2024, at 11:59 pm.
-
-## Contributors
-
-- [Iliya Mirzaei]
-
-## License
-
-This project is part of the CSE 535: Distributed Systems course and is subject to the course's academic policies.
+This project implements the Paxos consensus protocol as described in the course materials, with additional SmallBank benchmark evaluation following the paper "Serializable isolation for snapshot databases" by Michael J Cahill, Uwe Röhm, and Alan D Fekete. At the end I have used AI assistance for creating this readme and understanding the benchmark behavior and context.
