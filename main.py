@@ -9,6 +9,8 @@ from collections import defaultdict, deque
 from queue import Queue
 import random
 
+# Submit lab1
+
 NUM_NODES = 5
 NUM_CLIENTS = 10
 INITIAL_BALANCE = 10
